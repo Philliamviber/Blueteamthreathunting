@@ -1,0 +1,115 @@
+// ============================================================================
+// ZT Pillar       : Verify Explicitly
+// Tables          : SigninLogs, AADNonInteractiveUserSignInLogs, AADRiskyUsers
+//                   BehaviorAnalytics (UEBA — see UEBA note below)
+// MITRE Technique : T1078 / T1078.004 — Valid Accounts: Cloud Accounts
+// MITRE Tactic    : InitialAccess
+// TUNE            : RiskLevels list, LookbackWindow, MinCACompliantPct threshold,
+//                   watchlist boost increments (+10 / +25). Adjust CAGapMinutes
+//                   for your tenant's CA evaluation latency.
+//
+// Description:
+//   CORRELATION query — Verify Explicitly pillar.
+//   Combines three signals to surface sign-ins that violated the "verify on
+//   every request" principle:
+//     Signal 1: Interactive sign-in with medium/high Identity Protection risk
+//               AND Conditional Access policy outcome NOT "success" (CA gap).
+//     Signal 2: Matching non-interactive flows for the same account within the
+//               window (blind-spot path — service-principal or legacy-auth
+//               bypassing MFA prompts).
+//     Signal 3: AADRiskyUsers aggregate risk state ("high" / "medium") to
+//               confirm the account is flagged at the entity level, not just
+//               a one-off event.
+//   Accounts on VIPUsers or PrivilegedAccounts watchlists receive the additive
+//   boost defined in docs/zero-trust-model.md §2.4.
+//
+// UEBA NOTE: The BehaviorAnalytics join is OPTIONAL. If UEBA is not enabled
+//   the table will be empty and the join silently returns nulls, so results
+//   still appear — they just lack InvestigationPriority enrichment. Mark any
+//   row where InvestigationPriority is null as "UEBA-DISABLED" in review.
+//   REQUIRES UEBA: partial (degrades gracefully without it).
+// ============================================================================
+
+// ── Thresholds — document changes in docs/tuning-notes.md ──────────────────
+let LookbackWindow          = 1d;        // TUNE: evaluation window per run
+let RiskLevels              = dynamic(["high", "medium"]);  // TUNE: IP risk levels
+let NonInteractiveLookback  = 2h;        // TUNE: window to find matching non-interactive flows
+let MinInvestigationPriority = 0;        // TUNE: UEBA priority floor (0 = include all)
+
+// ── Watchlist lookups ───────────────────────────────────────────────────────
+let VIPList = _GetWatchlist("VIPUsers")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+let PrivList = _GetWatchlist("PrivilegedAccounts")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+// ── Signal 1: Risky interactive sign-ins with CA gap ───────────────────────
+let RiskyInteractive = SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where RiskLevelDuringSignIn in (RiskLevels)
+    | where ConditionalAccessStatus != "success"   // CA did not fully enforce policy
+    | extend CAOutcome = tostring(ConditionalAccessStatus)
+    | project TimeGenerated, UserPrincipalName, UserId,
+              IPAddress, Location, AppDisplayName,
+              RiskLevelDuringSignIn, CAOutcome,
+              AuthenticationRequirement, MfaDetail;
+
+// ── Signal 2: Non-interactive flows for same accounts (bypass indicator) ───
+let NonInteractiveFlows = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(NonInteractiveLookback)
+    | where ResultType == 0
+    | summarize NonInteractiveCount = count(),
+                NonInteractiveApps  = make_set(AppDisplayName, 10)
+      by UserPrincipalName, UserId;
+
+// ── Signal 3: AADRiskyUsers entity-level risk state ────────────────────────
+let EntityRisk = AADRiskyUsers
+    | where RiskLevel in ("high", "medium")
+    | project UserPrincipalName, EntityRiskLevel = RiskLevel,
+              EntityRiskState = RiskState, EntityRiskDetail = RiskDetail;
+
+// ── UEBA enrichment (optional — degrades gracefully if table absent) ────────
+// UEBA-DISABLED: comment the block below if BehaviorAnalytics is not enabled.
+let UEBAScores = BehaviorAnalytics
+    | where TimeGenerated > ago(LookbackWindow)
+    | summarize InvestigationPriority = max(InvestigationPriority)
+      by UserPrincipalName
+    | where InvestigationPriority >= MinInvestigationPriority;
+// END UEBA-DISABLED block
+
+// ── Correlate: risky sign-in + entity risk (inner) + non-interactive (left) ─
+let CorrelatedBase = RiskyInteractive
+    | join kind=inner (EntityRisk)
+          on $left.UserPrincipalName == $right.UserPrincipalName
+    | join kind=leftouter (NonInteractiveFlows)
+          on $left.UserPrincipalName == $right.UserPrincipalName
+    // UEBA-DISABLED: remove this join if BehaviorAnalytics absent
+    | join kind=leftouter (UEBAScores)
+          on $left.UserPrincipalName == $right.UserPrincipalName;
+    // END UEBA-DISABLED block
+
+// ── Apply watchlist joins and RiskScore boost ───────────────────────────────
+CorrelatedBase
+| join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+| join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+| extend IsVIP  = isnotempty(VIPReason),
+         IsPriv = isnotempty(AssignedRole)
+// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+// Base score: high IP risk = 20, medium = 10; +5 if non-interactive bypass present
+| extend BaseScore = case(RiskLevelDuringSignIn == "high", 20, 10)
+| extend RiskScore = BaseScore + RiskBoost
+         + iff(isnotempty(NonInteractiveCount), 5, 0)
+| extend RiskLabel = case(
+    IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+    IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+    IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+    UserPrincipalName)
+| sort by RiskScore desc, TimeGenerated desc
+| project TimeGenerated, RiskLabel, RiskScore,
+          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+          RiskLevelDuringSignIn, EntityRiskLevel, EntityRiskState, EntityRiskDetail,
+          CAOutcome, AuthenticationRequirement,
+          NonInteractiveCount, NonInteractiveApps,
+          InvestigationPriority,   // null when UEBA disabled
+          IPAddress, Location, AppDisplayName

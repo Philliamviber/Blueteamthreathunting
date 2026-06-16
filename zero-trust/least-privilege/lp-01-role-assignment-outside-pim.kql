@@ -1,0 +1,137 @@
+// ============================================================================
+// ZT Pillar       : Use Least Privilege
+// Tables          : AuditLogs, IdentityInfo (UEBA — see UEBA note below)
+// MITRE Technique : T1098 / T1098.003 — Account Manipulation: Additional Cloud Roles
+// MITRE Tactic    : PrivilegeEscalation
+// TUNE            : HighPrivRoles list, LookbackWindow, PIMActivationLookback —
+//                   window to check whether a PIM activation event preceded the
+//                   assignment (absence flags direct/static assignment bypass).
+//                   Watchlist boost increments (+10 / +25).
+//
+// Description:
+//   CORRELATION query — Use Least Privilege pillar.
+//   Least Privilege is violated when a role is assigned statically (permanently)
+//   rather than through PIM just-in-time activation, or when an assignment is made
+//   by an actor not themselves on the PrivilegedAccounts watchlist (unauthorized
+//   delegation). This query correlates:
+//     Signal 1: "Add member to role" AuditLogs entry for a high-privilege role.
+//     Signal 2: Absence of a preceding PIM activation event ("Add member to role
+//               (PIM activation)") in AuditLogs for the same actor within a
+//               configurable window — flags direct/static assignment that bypassed
+//               the just-in-time workflow.
+//     Signal 3: IdentityInfo enrichment (UEBA) to confirm whether the actor's
+//               job title / department is consistent with managing the assigned
+//               role. If absent, the assignment is still surfaced.
+//   Accounts on VIPUsers or PrivilegedAccounts watchlists (TARGET side) receive
+//   the additive boost defined in docs/zero-trust-model.md §2.4.
+//
+// UEBA NOTE: The IdentityInfo join provides job-title / department enrichment.
+//   If UEBA is not enabled, IdentityInfo is empty and the join returns nulls —
+//   results still appear without the enrichment columns. Mark those rows
+//   "UEBA-DISABLED" during review. REQUIRES UEBA: partial (degrades gracefully).
+// ============================================================================
+
+// ── Thresholds — document changes in docs/tuning-notes.md ──────────────────
+let LookbackWindow         = 1d;   // TUNE: AuditLogs search window per run
+let PIMActivationLookback  = 2h;   // TUNE: how far back to look for a PIM
+                                    //       activation preceding this assignment
+// TUNE: add/remove roles whose direct assignment should fire an alert
+let HighPrivRoles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Security Administrator",
+    "Exchange Administrator",
+    "SharePoint Administrator",
+    "Hybrid Identity Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator",
+    "Directory Synchronization Accounts"
+]);
+
+// ── Watchlist lookups ───────────────────────────────────────────────────────
+let VIPList = _GetWatchlist("VIPUsers")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+let PrivList = _GetWatchlist("PrivilegedAccounts")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+// ── Signal 1: Role assignment events ───────────────────────────────────────
+let RoleAssignments = AuditLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where OperationName in (
+          "Add member to role",
+          "Add scoped member to role",
+          "Add eligible member to role")
+    | mv-expand TargetResources
+    | extend TargetUPN     = tostring(TargetResources.userPrincipalName)
+    | extend TargetObjId   = tostring(TargetResources.id)
+    | extend RoleAssigned  = tostring(
+          TargetResources.modifiedProperties[0].newValue)
+    | extend ActorUPN      = tostring(InitiatedBy.user.userPrincipalName)
+    | extend ActorIPAddress = tostring(InitiatedBy.user.ipAddress)
+    | extend IsHighPrivRole = RoleAssigned in (HighPrivRoles)
+    | where isnotempty(TargetUPN)
+    | project AssignmentTime = TimeGenerated, TargetUPN, TargetObjId,
+              RoleAssigned, IsHighPrivRole,
+              ActorUPN, ActorIPAddress, OperationName, CorrelationId,
+              Result;
+
+// ── Signal 2: PIM activation events for the actor in the preceding window ───
+let PIMActivations = AuditLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where OperationName in (
+          "Add member to role (PIM activation)",
+          "Activate PIM eligible role")
+    | mv-expand TargetResources
+    | extend PIMActorUPN = tostring(TargetResources.userPrincipalName)
+    | extend PIMRole     = tostring(
+          TargetResources.modifiedProperties[0].newValue)
+    | project PIMActivationTime = TimeGenerated, PIMActorUPN, PIMRole;
+
+// ── Signal 3: IdentityInfo enrichment (UEBA — degrades gracefully if absent) ─
+// UEBA-DISABLED: comment the let block below if IdentityInfo is unavailable.
+let ActorInfo = IdentityInfo
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | project AccountUPN, ActorDepartment = Department,
+              ActorJobTitle = JobTitle;
+// END UEBA-DISABLED block
+
+// ── Correlate: assignment + absence of PIM activation ──────────────────────
+let CorrelatedBase = RoleAssignments
+    // Left-join on PIM activations — absence means direct/static assignment
+    | join kind=leftouter (PIMActivations)
+          on $left.ActorUPN == $right.PIMActorUPN
+    | extend PIMPreceded = isnotempty(PIMActivationTime)
+             and PIMActivationTime between (
+                 (AssignmentTime - PIMActivationLookback) .. AssignmentTime)
+    // UEBA-DISABLED: remove this join if IdentityInfo absent
+    | join kind=leftouter (ActorInfo)
+          on $left.ActorUPN == $right.AccountUPN
+    // END UEBA-DISABLED block
+    | extend BypassedPIM = (not(PIMPreceded))
+             and (OperationName == "Add member to role"
+                  or OperationName == "Add scoped member to role");
+
+// ── Apply watchlist joins and RiskScore boost (on TARGET) ───────────────────
+CorrelatedBase
+| join kind=leftouter (VIPList)  on $left.TargetUPN == $right.UPN
+| join kind=leftouter (PrivList) on $left.TargetUPN == $right.UPN
+| extend IsVIP  = isnotempty(VIPReason),
+         IsPriv = isnotempty(AssignedRole)
+// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+// +15 if high-priv role; +10 if PIM was bypassed (direct static assignment)
+| extend RiskScore = RiskBoost
+         + iff(IsHighPrivRole, 15, 0)
+         + iff(BypassedPIM, 10, 0)
+| extend RiskLabel = case(
+    IsVIP and IsPriv, strcat(TargetUPN, " [VIP+PRIV — HIGHEST PRIORITY]"),
+    IsVIP,            strcat(TargetUPN, " [VIP]"),
+    IsPriv,           strcat(TargetUPN, " [PRIV]"),
+    TargetUPN)
+| sort by RiskScore desc, IsHighPrivRole desc, AssignmentTime desc
+| project AssignmentTime, RiskLabel, RiskScore,
+          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+          RoleAssigned, IsHighPrivRole, BypassedPIM, PIMPreceded,
+          ActorUPN, ActorIPAddress, ActorDepartment, ActorJobTitle,  // null when UEBA disabled
+          OperationName, CorrelationId, Result

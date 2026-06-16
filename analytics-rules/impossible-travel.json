@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workspace": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Log Analytics / Sentinel workspace"
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2022-11-01-preview",
+      "name": "[concat(parameters('workspace'), '/Microsoft.SecurityInsights/', 'b63a33d2-e027-4cb9-915f-e1af301fea60')]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "Entra ID - Impossible travel detected for privileged or VIP account",
+        "description": "Detects sign-ins from the same account at two locations whose straight-line distance requires a travel speed exceeding 800 km/h, making physical travel impossible. The rule boosts risk priority for accounts on the VIPUsers or PrivilegedAccounts watchlists. ATT&CK: T1078.004 - Valid Accounts: Cloud Accounts (Initial Access / Assume Breach). TUNE: MaxSpeedKmh (default 800), MinDistanceKm (default 50), LookbackWindow (default 1d). Review TUNE comments in the query before deployment.",
+        "severity": "High",
+        "enabled": true,
+        "query": "// ── Thresholds — TUNE: document changes in docs/tuning-notes.md ──────────\nlet MaxSpeedKmh   = 800;       // TUNE: impossible-travel speed threshold (km/h)\nlet LookbackWindow = 1d;       // TUNE: evaluation window per scheduled run\nlet MinDistanceKm  = 50;       // TUNE: minimum distance to suppress same-metro noise\nlet EarthRadiusKm  = 6371.0;  // Earth mean radius — do not tune\n// ── Watchlist lookups ──────────────────────────────────────────────────────\nlet VIPList = _GetWatchlist(\"VIPUsers\")\n    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;\nlet PrivList = _GetWatchlist(\"PrivilegedAccounts\")\n    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;\n// ── Base events: interactive sign-ins with geolocation ────────────────────\nlet SignIns = SigninLogs\n    | where TimeGenerated > ago(LookbackWindow)\n    | where ResultType == 0\n    | where isnotempty(LocationDetails)\n    | extend Lat = toreal(LocationDetails.geoCoordinates.latitude),\n             Lon = toreal(LocationDetails.geoCoordinates.longitude),\n             City     = tostring(LocationDetails.city),\n             Country  = tostring(LocationDetails.countryOrRegion)\n    | where isnotnull(Lat) and isnotnull(Lon)\n    | project TimeGenerated, UserPrincipalName, UserId,\n              IPAddress, City, Country, Lat, Lon,\n              AppDisplayName, ConditionalAccessStatus, MfaDetail;\n// ── Pair consecutive sign-ins per user and compute speed ──────────────────\nlet Pairs = SignIns\n    | sort by UserPrincipalName asc, TimeGenerated asc\n    | extend PrevTime  = prev(TimeGenerated,  1),\n             PrevLat   = prev(Lat,  1),\n             PrevLon   = prev(Lon,  1),\n             PrevCity  = prev(City, 1),\n             PrevCountry = prev(Country, 1),\n             PrevIP    = prev(IPAddress, 1),\n             PrevUPN   = prev(UserPrincipalName, 1)\n    | where UserPrincipalName == PrevUPN\n    | extend ElapsedHours = datetime_diff('second', TimeGenerated, PrevTime) / 3600.0\n    | where ElapsedHours > 0\n    | extend DeltaLatRad = (Lat  - PrevLat)  * pi() / 180,\n             DeltaLonRad = (Lon  - PrevLon)  * pi() / 180,\n             Lat1Rad = PrevLat * pi() / 180,\n             Lat2Rad = Lat     * pi() / 180\n    | extend A = sin(DeltaLatRad / 2) * sin(DeltaLatRad / 2)\n             + cos(Lat1Rad) * cos(Lat2Rad)\n             * sin(DeltaLonRad / 2) * sin(DeltaLonRad / 2)\n    | extend DistanceKm = 2 * EarthRadiusKm * asin(sqrt(A))\n    | where DistanceKm > MinDistanceKm\n    | extend SpeedKmh = DistanceKm / ElapsedHours\n    | where SpeedKmh > MaxSpeedKmh;\n// ── Apply watchlist joins and RiskScore boost ──────────────────────────────\nPairs\n| join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN\n| join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN\n| extend IsVIP  = isnotempty(VIPReason),\n         IsPriv = isnotempty(AssignedRole)\n// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)\n| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)\n| extend RiskScore = RiskBoost\n| extend RiskLabel = case(\n    IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"),\n    IsVIP,            strcat(UserPrincipalName, \" [VIP]\"),\n    IsPriv,           strcat(UserPrincipalName, \" [PRIV]\"),\n    UserPrincipalName)\n| sort by RiskScore desc, TimeGenerated desc\n| project TimeGenerated, RiskLabel, RiskScore,\n          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,\n          PrevTime, PrevCity, PrevCountry, PrevIP,\n          City, Country, IPAddress,\n          DistanceKm = round(DistanceKm, 1),\n          SpeedKmh   = round(SpeedKmh, 1),\n          ElapsedHours = round(ElapsedHours, 4),\n          AppDisplayName, ConditionalAccessStatus",
+        "queryFrequency": "PT1H",
+        "queryPeriod": "PT1H",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": ["InitialAccess"],
+        "techniques": ["T1078", "T1078.004"],
+        "entityMappings": [
+          {
+            "entityType": "Account",
+            "fieldMappings": [
+              {
+                "identifier": "FullName",
+                "columnName": "RiskLabel"
+              }
+            ]
+          },
+          {
+            "entityType": "IP",
+            "fieldMappings": [
+              {
+                "identifier": "Address",
+                "columnName": "IPAddress"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

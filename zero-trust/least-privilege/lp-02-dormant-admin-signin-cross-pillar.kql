@@ -1,0 +1,108 @@
+// ============================================================================
+// ZT Pillar       : Use Least Privilege
+// Tables          : SigninLogs, AuditLogs
+// MITRE Technique : T1078 / T1078.004 — Valid Accounts: Cloud Accounts
+// MITRE Tactic    : Persistence (primary); DefenseEvasion (supporting)
+// TUNE            : DormantThresholdDays (default 30), RecentWindow (default 1d),
+//                   HistoryWindow (default 180d — how far back to establish the
+//                   last-seen baseline). Watchlist boost increments (+10 / +25).
+//                   OffHoursStart / OffHoursEnd — flag reactivations that also
+//                   occur outside business hours (corroborating Assume Breach signal).
+//
+// Description:
+//   CORRELATION query — Use Least Privilege pillar (cross-pillar: Assume Breach).
+//   A dormant privileged account is a standing-privilege hygiene failure: the role
+//   was granted and never revoked even as the account became inactive. An attacker
+//   reactivating such an account exploits this Least Privilege gap while also
+//   exhibiting a post-breach behavior (Assume Breach). This query correlates:
+//     Signal 1: Accounts with admin-role assignments in AuditLogs that have had
+//               no successful sign-in for at least DormantThresholdDays days.
+//     Signal 2: A new successful sign-in for that same account in the RecentWindow.
+//     Signal 3 (corroborating): The reactivation sign-in occurred outside business
+//               hours (off-hours flag), strengthening the Assume Breach dimension.
+//   Accounts on VIPUsers or PrivilegedAccounts watchlists receive the additive
+//   boost defined in docs/zero-trust-model.md §2.4.
+//
+// REQUIRES UEBA: false — uses only SigninLogs and AuditLogs.
+// ============================================================================
+
+// ── Thresholds — document changes in docs/tuning-notes.md ──────────────────
+let DormantThresholdDays = 30;    // TUNE: inactivity days before account is "dormant"
+let RecentWindow         = 1d;    // TUNE: window to detect the reactivation sign-in
+let HistoryWindow        = 180d;  // TUNE: how far back to establish the last-seen baseline
+let OffHoursStart        = 7;     // TUNE: business hours start (UTC 24h, inclusive)
+let OffHoursEnd          = 19;    // TUNE: business hours end (UTC 24h, exclusive)
+let UtcOffsetHours       = 0;     // TUNE: UTC offset for primary admin timezone
+
+// ── Watchlist lookups ───────────────────────────────────────────────────────
+let VIPList = _GetWatchlist("VIPUsers")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+let PrivList = _GetWatchlist("PrivilegedAccounts")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+// ── Signal 1: Admin-role holders from AuditLogs ─────────────────────────────
+let AdminRoleHolders = AuditLogs
+    | where OperationName in ("Add member to role", "Add eligible member to role")
+    | mv-expand TargetResources
+    | extend TargetUPN = tostring(TargetResources.userPrincipalName)
+    | extend RoleName  = tostring(
+          TargetResources.modifiedProperties[0].newValue)
+    | where isnotempty(TargetUPN)
+    | summarize AssignedRolesFromAudit = make_set(RoleName, 10) by TargetUPN;
+
+// ── Last successful sign-in per account (history baseline) ───────────────────
+let LastSignIn = SigninLogs
+    | where TimeGenerated between (ago(HistoryWindow) .. ago(RecentWindow))
+    | where ResultType == 0
+    | summarize LastSuccessfulSignIn = max(TimeGenerated) by UserPrincipalName;
+
+// ── Signal 2: Reactivation — recent successful sign-ins ─────────────────────
+let RecentSignIns = SigninLogs
+    | where TimeGenerated > ago(RecentWindow)
+    | where ResultType == 0
+    | project ReactivationTime = TimeGenerated, UserPrincipalName, UserId,
+              IPAddress, AppDisplayName, ConditionalAccessStatus,
+              LocationDetails, MfaDetail;
+
+// ── Signal 3: Off-hours flag on the reactivation event ──────────────────────
+let CorrelatedBase = RecentSignIns
+    | join kind=inner (AdminRoleHolders)
+          on $left.UserPrincipalName == $right.TargetUPN
+    | join kind=leftouter (LastSignIn)
+          on $left.UserPrincipalName == $right.UserPrincipalName
+    | where isnotempty(LastSuccessfulSignIn)
+    | where datetime_diff('day', ReactivationTime, LastSuccessfulSignIn)
+            >= DormantThresholdDays
+    | extend DaysDormant = datetime_diff('day', ReactivationTime, LastSuccessfulSignIn)
+    // Off-hours corroborating signal
+    | extend LocalHour = hourofday(ReactivationTime) + UtcOffsetHours
+    | extend LocalHour = iff(LocalHour < 0, LocalHour + 24,
+                             iff(LocalHour >= 24, LocalHour - 24, LocalHour))
+    | extend DayOfWeek    = dayofweek(ReactivationTime)
+    | extend IsWeekend    = DayOfWeek in (0, 6)
+    | extend IsOffHours   = (LocalHour < OffHoursStart or LocalHour >= OffHoursEnd)
+    | extend OffHoursFlag = IsWeekend or IsOffHours;
+
+// ── Apply watchlist joins and RiskScore boost ───────────────────────────────
+CorrelatedBase
+| join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+| join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+| extend IsVIP  = isnotempty(VIPReason),
+         IsPriv = isnotempty(AssignedRole)
+// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+// +10 if reactivation was during off-hours (corroborating Assume Breach signal)
+| extend RiskScore = RiskBoost + iff(OffHoursFlag, 10, 0)
+| extend RiskLabel = case(
+    IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+    IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+    IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+    UserPrincipalName)
+| sort by RiskScore desc, DaysDormant desc, ReactivationTime desc
+| project ReactivationTime, RiskLabel, RiskScore,
+          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+          DaysDormant, LastSuccessfulSignIn,
+          AssignedRolesFromAudit,
+          OffHoursFlag, IsWeekend, IsOffHours, LocalHour,
+          IPAddress, AppDisplayName, ConditionalAccessStatus

@@ -1,0 +1,128 @@
+// ============================================================================
+// ZT Pillar       : Assume Breach
+// Tables          : SigninLogs, AuditLogs
+// MITRE Technique : T1110 — Brute Force (MFA fatigue / push bombing);
+//                   T1556.006 — Modify Authentication Process: MFA (backdoor);
+//                   T1098.005 — Account Manipulation: Device Registration
+// MITRE Tactic    : CredentialAccess (primary); Persistence (supporting via T1556)
+// TUNE            : DenialThreshold (default 5 denials / 10-minute window),
+//                   TimeWindowMinutes (default 10), LookbackWindow (default 1d),
+//                   TamperWindowHours — how wide a window around the denial burst
+//                   to search for an auth-method tampering event (default 24h).
+//                   Watchlist boost increments (+10 / +25).
+//
+// Description:
+//   CORRELATION query — Assume Breach pillar (highest-fidelity combined signal).
+//   The two-stage MFA-bypass attack pattern: first the adversary bombs the user
+//   with MFA prompts (fatigue), then — whether or not the user approved — the
+//   adversary registers their own authenticator for persistent access. Detecting
+//   either signal alone has moderate fidelity; detecting BOTH for the same account
+//   within a short window is a near-definitive indicator of compromise.
+//   This query correlates:
+//     Signal 1: MFA denial burst (ResultType 500121 / 50074 / 50076) — >= 5
+//               denials in a 10-minute rolling window (push-bombing signature).
+//     Signal 2: AuditLogs auth-method registration / deletion event
+//               (UpdateStrongAuthenticationPhoneAppDetail, Register security info,
+//               Create FIDO key, etc.) for the same account within TamperWindowHours
+//               of the burst.
+//   Rows where BOTH signals are present are flagged IsFulLAttackChain = true and
+//   score highest. Rows with only Signal 1 are still surfaced for hunting.
+//   Accounts on VIPUsers or PrivilegedAccounts watchlists receive the additive
+//   boost defined in docs/zero-trust-model.md §2.4.
+//
+// REQUIRES UEBA: false — uses only SigninLogs and AuditLogs.
+// ============================================================================
+
+// ── Thresholds — document changes in docs/tuning-notes.md ──────────────────
+let DenialThreshold    = 5;    // TUNE: MFA denials in the window to trigger
+let TimeWindowMinutes  = 10;   // TUNE: rolling window size (minutes)
+let LookbackWindow     = 1d;   // TUNE: search window per scheduled run
+let TamperWindowHours  = 24;   // TUNE: hours around burst to find tampering event
+                                //       Set lower (e.g. 4h) for higher precision;
+                                //       24h catches slow-burn post-fatigue registration
+
+// ── Watchlist lookups ───────────────────────────────────────────────────────
+let VIPList = _GetWatchlist("VIPUsers")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+let PrivList = _GetWatchlist("PrivilegedAccounts")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+// ── Signal 1: MFA denial burst ──────────────────────────────────────────────
+// ResultType 500121 = MFA required and denied / push declined
+// ResultType 50074  = strong auth required (user cancelled / timed out)
+// ResultType 50076  = MFA challenge presented but not satisfied
+let MFABursts = SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType in (500121, 50074, 50076)
+    | summarize DenialCount  = count(),
+                FirstDenial  = min(TimeGenerated),
+                LastDenial   = max(TimeGenerated),
+                UniqueIPs    = make_set(IPAddress, 20),
+                Apps         = make_set(AppDisplayName, 10),
+                ResultTypes  = make_set(ResultType, 5)
+      by UserPrincipalName, UserId,
+         bin(TimeGenerated, totimespan(strcat(tostring(TimeWindowMinutes), 'm')))
+    | where DenialCount >= DenialThreshold;
+
+// ── Signal 2: Auth-method tampering in AuditLogs ────────────────────────────
+// TUNE: add/remove OperationName values to match tenant's log verbosity
+let AuthMethodTampering = AuditLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where OperationName in (
+          "UpdateStrongAuthenticationPhoneAppDetail",
+          "Register security info",
+          "Delete security info",
+          "User registered security info",
+          "User deleted security info",
+          "Admin registered security info",
+          "Admin deleted security info",
+          "Update strong authentication method",
+          "Create FIDO key",
+          "Update FIDO key")
+    | where Category in ("UserManagement", "Authentication", "MFA")
+    | mv-expand TargetResources
+    | extend TargetUPN     = tostring(TargetResources.userPrincipalName)
+    | extend ActorUPN      = tostring(InitiatedBy.user.userPrincipalName)
+    | extend ActorIP       = tostring(InitiatedBy.user.ipAddress)
+    | extend IsSelfChange  = (ActorUPN =~ TargetUPN)
+    | where isnotempty(TargetUPN)
+    | project TamperTime = TimeGenerated, TargetUPN, ActorUPN, ActorIP,
+              TamperOperation = OperationName, IsSelfChange, CorrelationId;
+
+// ── Correlate: burst + tampering for same account within window ─────────────
+let CorrelatedBase = MFABursts
+    | join kind=leftouter (AuthMethodTampering)
+          on $left.UserPrincipalName == $right.TargetUPN
+    // Is the tampering event within TamperWindowHours of the last denial?
+    | extend HoursBetween = abs(datetime_diff('minute',
+              iff(isnotempty(TamperTime), TamperTime, LastDenial),
+              LastDenial)) / 60.0
+    | extend IsFullAttackChain = isnotempty(TamperOperation)
+                                 and HoursBetween <= TamperWindowHours;
+
+// ── Apply watchlist joins and RiskScore boost ───────────────────────────────
+CorrelatedBase
+| join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+| join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+| extend IsVIP  = isnotempty(VIPReason),
+         IsPriv = isnotempty(AssignedRole)
+// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+// +25 when full attack chain confirmed (both signals for same account in window)
+// +5 additional if self-initiated tamper (attacker acting as the user)
+| extend RiskScore = RiskBoost
+         + iff(IsFullAttackChain, 25, 0)
+         + iff(IsFullAttackChain and IsSelfChange, 5, 0)
+| extend RiskLabel = case(
+    IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+    IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+    IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+    UserPrincipalName)
+| sort by RiskScore desc, IsFullAttackChain desc, DenialCount desc, LastDenial desc
+| project FirstDenial, LastDenial, RiskLabel, RiskScore,
+          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+          DenialCount, UniqueIPs, Apps, ResultTypes,
+          IsFullAttackChain, TamperOperation, TamperTime, IsSelfChange,
+          ActorUPN, ActorIP, HoursBetween, CorrelationId,
+          WindowMinutes = TimeWindowMinutes

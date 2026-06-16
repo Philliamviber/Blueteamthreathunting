@@ -1,0 +1,130 @@
+// ============================================================================
+// ZT Pillar       : Assume Breach
+// Tables          : SigninLogs, AADUserRiskEvents
+// MITRE Technique : T1078 / T1078.004 — Valid Accounts: Cloud Accounts
+// MITRE Tactic    : InitialAccess
+// TUNE            : MaxSpeedKmh (default 800 km/h), MinDistanceKm (default 50 km),
+//                   LookbackWindow (default 1d), RiskEventTypes — AADUserRiskEvents
+//                   event types to correlate (default: atypicalTravel,
+//                   unfamiliarFeatures, maliciousIPAddress). Watchlist boost
+//                   increments (+10 / +25).
+//
+// Description:
+//   CORRELATION query — Assume Breach pillar.
+//   Assume Breach posits that valid credentials are already in attacker hands.
+//   Geovelocity impossible travel is the strongest post-authentication indicator
+//   that the same credentials are being used concurrently from different locations.
+//   This query CORRELATES two independent signals for higher fidelity:
+//     Signal 1: Consecutive SigninLogs pairs for the same account whose straight-
+//               line travel speed exceeds MaxSpeedKmh (Haversine distance / time).
+//     Signal 2: A matching AADUserRiskEvents entry for the same account in the
+//               same window — Identity Protection's own atypical-travel or
+//               anomalous-token detection corroborating the geometric calculation.
+//   Requiring both signals before alerting substantially reduces VPN/proxy FPs
+//   (which fail the risk-event corroboration). Single-signal rows are still
+//   surfaced with a lower RiskScore for hunting review.
+//   Accounts on VIPUsers or PrivilegedAccounts watchlists receive the additive
+//   boost defined in docs/zero-trust-model.md §2.4.
+//
+// REQUIRES UEBA: false — uses only SigninLogs and AADUserRiskEvents.
+// ============================================================================
+
+// ── Thresholds — document changes in docs/tuning-notes.md ──────────────────
+let MaxSpeedKmh    = 800;       // TUNE: km/h threshold for impossible travel
+let MinDistanceKm  = 50;        // TUNE: minimum km to suppress same-metro noise
+let LookbackWindow = 1d;        // TUNE: evaluation window per scheduled run
+let EarthRadiusKm  = 6371.0;   // Earth mean radius — do not tune
+// TUNE: AADUserRiskEvents riskEventType values to correlate as corroborating signal
+let CorroboratingRiskTypes = dynamic([
+    "atypicalTravel",
+    "unfamiliarFeatures",
+    "maliciousIPAddress",
+    "anonymizedIPAddress",
+    "impossibleTravel"
+]);
+
+// ── Watchlist lookups ───────────────────────────────────────────────────────
+let VIPList = _GetWatchlist("VIPUsers")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+let PrivList = _GetWatchlist("PrivilegedAccounts")
+    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+// ── Signal 1: Impossible-travel pairs from SigninLogs ───────────────────────
+let SignIns = SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType == 0   // successful sign-ins only
+    | where isnotempty(LocationDetails)
+    | extend Lat     = toreal(LocationDetails.geoCoordinates.latitude),
+             Lon     = toreal(LocationDetails.geoCoordinates.longitude),
+             City    = tostring(LocationDetails.city),
+             Country = tostring(LocationDetails.countryOrRegion)
+    | where isnotnull(Lat) and isnotnull(Lon)
+    | project TimeGenerated, UserPrincipalName, UserId,
+              IPAddress, City, Country, Lat, Lon,
+              AppDisplayName, ConditionalAccessStatus;
+
+let TravelPairs = SignIns
+    | sort by UserPrincipalName asc, TimeGenerated asc
+    | extend PrevTime    = prev(TimeGenerated, 1),
+             PrevLat     = prev(Lat, 1),
+             PrevLon     = prev(Lon, 1),
+             PrevCity    = prev(City, 1),
+             PrevCountry = prev(Country, 1),
+             PrevIP      = prev(IPAddress, 1),
+             PrevUPN     = prev(UserPrincipalName, 1)
+    | where UserPrincipalName == PrevUPN
+    | extend ElapsedHours = datetime_diff('second', TimeGenerated, PrevTime) / 3600.0
+    | where ElapsedHours > 0
+    // Haversine distance (km)
+    | extend DeltaLatRad = (Lat  - PrevLat)  * pi() / 180,
+             DeltaLonRad = (Lon  - PrevLon)  * pi() / 180,
+             Lat1Rad = PrevLat * pi() / 180,
+             Lat2Rad = Lat     * pi() / 180
+    | extend A = sin(DeltaLatRad / 2) * sin(DeltaLatRad / 2)
+             + cos(Lat1Rad) * cos(Lat2Rad)
+             * sin(DeltaLonRad / 2) * sin(DeltaLonRad / 2)
+    | extend DistanceKm = 2 * EarthRadiusKm * asin(sqrt(A))
+    | where DistanceKm > MinDistanceKm
+    | extend SpeedKmh = DistanceKm / ElapsedHours
+    | where SpeedKmh > MaxSpeedKmh;
+
+// ── Signal 2: AADUserRiskEvents corroboration ────────────────────────────────
+let RiskCorroboration = AADUserRiskEvents
+    | where TimeGenerated > ago(LookbackWindow)
+    | where RiskEventType in (CorroboratingRiskTypes)
+    | summarize RiskEventTypes   = make_set(RiskEventType, 10),
+                HighestRiskLevel = max(RiskLevel)
+      by UserPrincipalName;
+
+// ── Correlate: travel pairs + risk events (leftouter — keep single-signal rows)
+let CorrelatedBase = TravelPairs
+    | join kind=leftouter (RiskCorroboration)
+          on $left.UserPrincipalName == $right.UserPrincipalName
+    | extend HasRiskCorroboration = isnotempty(RiskEventTypes);
+
+// ── Apply watchlist joins and RiskScore boost ───────────────────────────────
+CorrelatedBase
+| join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+| join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+| extend IsVIP  = isnotempty(VIPReason),
+         IsPriv = isnotempty(AssignedRole)
+// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+// +20 when Identity Protection risk event corroborates the geometric calculation
+| extend RiskScore = RiskBoost + iff(HasRiskCorroboration, 20, 0)
+| extend RiskLabel = case(
+    IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+    IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+    IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+    UserPrincipalName)
+| sort by RiskScore desc, SpeedKmh desc, TimeGenerated desc
+| project TimeGenerated, RiskLabel, RiskScore,
+          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+          PrevTime, PrevCity, PrevCountry, PrevIP,
+          City, Country, IPAddress,
+          DistanceKm   = round(DistanceKm, 1),
+          SpeedKmh     = round(SpeedKmh, 1),
+          ElapsedHours = round(ElapsedHours, 4),
+          HasRiskCorroboration, RiskEventTypes, HighestRiskLevel,
+          AppDisplayName, ConditionalAccessStatus

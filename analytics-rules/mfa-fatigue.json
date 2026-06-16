@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workspace": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Log Analytics / Sentinel workspace"
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2022-11-01-preview",
+      "name": "[concat(parameters('workspace'), '/Microsoft.SecurityInsights/', 'a37ce261-3184-4427-8408-6a2276ba258c')]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "Entra ID - MFA fatigue attack detected (push bombing)",
+        "description": "Detects accounts that accumulate more than 5 MFA denial events (ResultType 500121 / 50074 / 50076) within a 10-minute rolling window — the signature of a push-bombing / MFA-fatigue attack. The rule boosts risk priority for accounts on the VIPUsers or PrivilegedAccounts watchlists. ATT&CK: T1110 - Brute Force (Credential Access); upgrade target T1621 deferred to v0.2.0. TUNE: DenialThreshold (default 5), TimeWindowMinutes (default 10), LookbackWindow (default 1d). Review TUNE comments in the query before deployment.",
+        "severity": "High",
+        "enabled": true,
+        "query": "// ── Thresholds — TUNE: document changes in docs/tuning-notes.md ──────────\nlet DenialThreshold    = 5;        // TUNE: MFA denial count threshold\nlet TimeWindowMinutes  = 10;       // TUNE: rolling window (minutes)\nlet LookbackWindow     = 1d;       // TUNE: search window per scheduled run\n// ── Watchlist lookups ──────────────────────────────────────────────────────\nlet VIPList = _GetWatchlist(\"VIPUsers\")\n    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;\nlet PrivList = _GetWatchlist(\"PrivilegedAccounts\")\n    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;\n// ── Base events: MFA denied / push-declined sign-in attempts ──────────────\n// ResultType 500121 = MFA required, denied or push notification declined\n// ResultType 50074  = Strong auth required (user cancelled / timed out)\n// ResultType 50076  = MFA challenge presented but not satisfied\nlet MFADenials = SigninLogs\n    | where TimeGenerated > ago(LookbackWindow)\n    | where ResultType in (500121, 50074, 50076)\n    | project TimeGenerated, UserPrincipalName, UserId,\n              IPAddress, AppDisplayName, ResultType, ResultDescription,\n              ConditionalAccessStatus, AuthenticationDetails;\n// ── Aggregate denials within the rolling window ────────────────────────────\nlet BaseEvents = MFADenials\n    | summarize DenialCount    = count(),\n                FirstDenial    = min(TimeGenerated),\n                LastDenial     = max(TimeGenerated),\n                UniqueIPs      = make_set(IPAddress, 20),\n                Apps           = make_set(AppDisplayName, 10),\n                ResultTypes    = make_set(ResultType, 5)\n      by UserPrincipalName, UserId,\n         bin(TimeGenerated, totimespan(strcat(tostring(TimeWindowMinutes), 'm')))\n    | where DenialCount >= DenialThreshold;\n// ── Apply watchlist joins and RiskScore boost ──────────────────────────────\nBaseEvents\n| join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN\n| join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN\n| extend IsVIP  = isnotempty(VIPReason),\n         IsPriv = isnotempty(AssignedRole)\n// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)\n| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)\n| extend RiskScore = RiskBoost\n| extend RiskLabel = case(\n    IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"),\n    IsVIP,            strcat(UserPrincipalName, \" [VIP]\"),\n    IsPriv,           strcat(UserPrincipalName, \" [PRIV]\"),\n    UserPrincipalName)\n| sort by RiskScore desc, DenialCount desc, LastDenial desc\n| project FirstDenial, LastDenial, RiskLabel, RiskScore,\n          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,\n          DenialCount, UniqueIPs, Apps, ResultTypes,\n          WindowMinutes = TimeWindowMinutes",
+        "queryFrequency": "PT15M",
+        "queryPeriod": "PT15M",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": ["CredentialAccess"],
+        "techniques": ["T1110"],
+        "entityMappings": [
+          {
+            "entityType": "Account",
+            "fieldMappings": [
+              {
+                "identifier": "FullName",
+                "columnName": "RiskLabel"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

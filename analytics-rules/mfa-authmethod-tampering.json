@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workspace": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Log Analytics / Sentinel workspace"
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2022-11-01-preview",
+      "name": "[concat(parameters('workspace'), '/Microsoft.SecurityInsights/', '0b00478a-4899-4f46-9ef0-05579018bba2')]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "Entra ID - MFA or authentication-method tampering detected",
+        "description": "Detects changes to a user's registered MFA methods or authentication phone app details in AuditLogs. Monitored operations include UpdateStrongAuthenticationPhoneAppDetail, Register/Delete security info, Create/Update FIDO key, Update strong authentication method. An attacker registering an additional authenticator establishes persistent backdoor access. Self-initiated changes to VIP or privileged accounts score highest. The rule boosts risk priority for accounts on the VIPUsers or PrivilegedAccounts watchlists. ATT&CK: T1556.006 - Modify Authentication Process: MFA (Credential Access); secondary T1098.005. TUNE: LookbackWindow (default 1d), WatchedOperations list. Review TUNE comments in the query before deployment.",
+        "severity": "High",
+        "enabled": true,
+        "query": "// ── Thresholds — TUNE: document changes in docs/tuning-notes.md ──────────\nlet LookbackWindow = 1d;  // TUNE: AuditLogs search window per scheduled run\n// TUNE: AuditLogs operation names covering auth-method registration / deletion / updates\nlet WatchedOperations = dynamic([\n    \"UpdateStrongAuthenticationPhoneAppDetail\",\n    \"Update user\",\n    \"Register security info\",\n    \"Delete security info\",\n    \"Update strong authentication method\",\n    \"Create FIDO key\",\n    \"Update FIDO key\",\n    \"User registered security info\",\n    \"User deleted security info\",\n    \"Admin registered security info\",\n    \"Admin deleted security info\"\n]);\n// ── Watchlist lookups ──────────────────────────────────────────────────────\nlet VIPList = _GetWatchlist(\"VIPUsers\")\n    | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;\nlet PrivList = _GetWatchlist(\"PrivilegedAccounts\")\n    | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;\n// ── Base events: auth-method change AuditLogs entries ─────────────────────\nlet BaseEvents = AuditLogs\n    | where TimeGenerated > ago(LookbackWindow)\n    | where OperationName in (WatchedOperations)\n    | where Category in (\"UserManagement\", \"Authentication\", \"MFA\")\n    | mv-expand TargetResources\n    | extend TargetUPN    = tostring(TargetResources.userPrincipalName)\n    | extend TargetObjId  = tostring(TargetResources.id)\n    | extend ChangedProps = tostring(TargetResources.modifiedProperties)\n    | extend ActorUPN     = tostring(InitiatedBy.user.userPrincipalName)\n    | extend ActorIP      = tostring(InitiatedBy.user.ipAddress)\n    | extend IsSelfInitiated = (ActorUPN =~ TargetUPN)\n    | where isnotempty(TargetUPN)\n    | project TimeGenerated, TargetUPN, TargetObjId,\n              OperationName, ChangedProps, IsSelfInitiated,\n              ActorUPN, ActorIP, CorrelationId,\n              Result, ResultDescription;\n// ── Apply watchlist joins and RiskScore boost ──────────────────────────────\nBaseEvents\n| join kind=leftouter (VIPList)  on $left.TargetUPN == $right.UPN\n| join kind=leftouter (PrivList) on $left.TargetUPN == $right.UPN\n| extend IsVIP  = isnotempty(VIPReason),\n         IsPriv = isnotempty(AssignedRole)\n// TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)\n| extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)\n| extend RiskScore = RiskBoost + iff(IsSelfInitiated and (IsVIP or IsPriv), 10, 0)\n| extend RiskLabel = case(\n    IsVIP and IsPriv, strcat(TargetUPN, \" [VIP+PRIV — HIGHEST PRIORITY]\"),\n    IsVIP,            strcat(TargetUPN, \" [VIP]\"),\n    IsPriv,           strcat(TargetUPN, \" [PRIV]\"),\n    TargetUPN)\n| sort by RiskScore desc, TimeGenerated desc\n| project TimeGenerated, RiskLabel, RiskScore,\n          IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,\n          OperationName, IsSelfInitiated,\n          ActorUPN, ActorIP, ChangedProps,\n          CorrelationId, Result",
+        "queryFrequency": "PT1H",
+        "queryPeriod": "PT1H",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": ["CredentialAccess"],
+        "techniques": ["T1556", "T1556.006", "T1098.005"],
+        "entityMappings": [
+          {
+            "entityType": "Account",
+            "fieldMappings": [
+              {
+                "identifier": "FullName",
+                "columnName": "RiskLabel"
+              }
+            ]
+          },
+          {
+            "entityType": "Account",
+            "fieldMappings": [
+              {
+                "identifier": "FullName",
+                "columnName": "ActorUPN"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
