@@ -1,0 +1,110 @@
+id: 2f9c4e7a-6b3d-4a8f-c1e5-9d7b0f2e4c6a
+name: New or elevated admin-role assignment
+description: |
+  Detects when an Entra ID directory role (any admin role) is assigned to an account,
+  or when an existing assignment is elevated to a higher-privilege role. This covers
+  both direct (static) assignments and PIM-eligible role activations recorded in
+  AuditLogs under "Add member to role" and "Add eligible member to role" operations.
+
+  The query identifies the target account (who received the role) and the initiating
+  actor (who performed the assignment). Both are enriched with watchlist context.
+  An assignment where the TARGET is on VIPUsers or PrivilegedAccounts receives the
+  standard boost; an assignment where the ACTOR is on PrivilegedAccounts but the
+  target is not may indicate unauthorized delegation.
+
+  ATT&CK: T1098.003 — Account Manipulation: Additional Cloud Roles (Privilege Escalation).
+  ZT pillar: Use Least Privilege.
+
+  STARTING TEMPLATE — review all TUNE: comments before deployment. Not production-ready.
+severity: High
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - AuditLogs
+tactics:
+  - PrivilegeEscalation
+relevantTechniques:
+  - T1098
+  - T1098.003
+requiresUEBA: false
+tuneThresholds:
+  LookbackWindow: 1d       # TUNE: how far back to search AuditLogs per run.
+  BoostVIP: 10             # TUNE: RiskScore increment for VIPUsers-only target accounts.
+  BoostPriv: 10            # TUNE: RiskScore increment for PrivilegedAccounts-only target accounts.
+  BoostBoth: 25            # TUNE: RiskScore increment for target accounts on BOTH watchlists.
+  HighPrivRoles:           # TUNE: role names that trigger a higher-severity flag.
+    - "Global Administrator"
+    - "Privileged Role Administrator"
+    - "Security Administrator"
+    - "Exchange Administrator"
+    - "SharePoint Administrator"
+    - "Hybrid Identity Administrator"
+query: |
+  // ── Thresholds — change values here, document reason in docs/tuning-notes.md ──
+  let LookbackWindow = 1d;  // TUNE: AuditLogs search window per scheduled run
+  // TUNE: roles whose assignment should be treated as highest-severity
+  let HighPrivRoles = dynamic([
+      "Global Administrator",
+      "Privileged Role Administrator",
+      "Security Administrator",
+      "Exchange Administrator",
+      "SharePoint Administrator",
+      "Hybrid Identity Administrator"
+  ]);
+
+  // ── Watchlist lookups ──────────────────────────────────────────────────────
+  let VIPList = _GetWatchlist("VIPUsers")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+  let PrivList = _GetWatchlist("PrivilegedAccounts")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+  // ── Base events: role-assignment audit entries ────────────────────────────
+  let BaseEvents = AuditLogs
+      | where TimeGenerated > ago(LookbackWindow)
+      | where OperationName in (
+            "Add member to role",
+            "Add eligible member to role",
+            "Add scoped member to role")
+      | mv-expand TargetResources
+      | extend TargetUPN     = tostring(TargetResources.userPrincipalName)
+      | extend TargetObjId   = tostring(TargetResources.id)
+      | extend RoleAssigned  = tostring(
+            TargetResources.modifiedProperties[0].newValue)
+      | extend ActorUPN      = tostring(InitiatedBy.user.userPrincipalName)
+      | extend ActorIPAddress = tostring(InitiatedBy.user.ipAddress)
+      | extend IsHighPrivRole = RoleAssigned in (HighPrivRoles)
+      | where isnotempty(TargetUPN)
+      | project TimeGenerated, TargetUPN, TargetObjId, RoleAssigned, IsHighPrivRole,
+                ActorUPN, ActorIPAddress, OperationName, CorrelationId,
+                Result, ResultDescription;
+
+  // ── Apply watchlist joins on TARGET account and RiskScore boost ───────────
+  BaseEvents
+  | join kind=leftouter (VIPList)  on $left.TargetUPN == $right.UPN
+  | join kind=leftouter (PrivList) on $left.TargetUPN == $right.UPN
+  | extend IsVIP  = isnotempty(VIPReason),
+           IsPriv = isnotempty(AssignedRole)
+  // TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+  | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+  // Additional boost when role assigned is in the high-priv list
+  | extend RiskScore = RiskBoost + iff(IsHighPrivRole, 15, 0)
+  | extend RiskLabel = case(
+      IsVIP and IsPriv, strcat(TargetUPN, " [VIP+PRIV — HIGHEST PRIORITY]"),
+      IsVIP,            strcat(TargetUPN, " [VIP]"),
+      IsPriv,           strcat(TargetUPN, " [PRIV]"),
+      TargetUPN)
+  | sort by RiskScore desc, IsHighPrivRole desc, TimeGenerated desc
+  | project TimeGenerated, RiskLabel, RiskScore,
+            IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+            RoleAssigned, IsHighPrivRole,
+            ActorUPN, ActorIPAddress,
+            OperationName, CorrelationId, Result
+tags:
+  - ZTPillar: LeastPrivilege
+  - MITRETactic: PrivilegeEscalation
+  - MITRETechnique: T1098
+  - MITRETechnique: T1098.003
+  - DataSource: AuditLogs
+  - WatchlistBoost: VIPUsers+PrivilegedAccounts
+  - RequiresUEBA: "false"

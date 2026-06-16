@@ -1,0 +1,115 @@
+id: 7d1e5a3c-9b2f-4c6e-a8d0-1f3e5b7c9d2e
+name: Dormant admin account reactivation
+description: |
+  Detects privileged accounts (holding any admin role) that have been inactive for at
+  least the configured inactivity window (default 30 days) and then produce a successful
+  sign-in. Dormant accounts reactivated by an attacker are a persistence technique:
+  the attacker finds an existing but forgotten admin credential, uses it, and the activity
+  blends in as a returning legitimate user.
+
+  Strategy: query AuditLogs for accounts with admin roles assigned, find those whose
+  last successful sign-in in SigninLogs predates the inactivity threshold, then detect
+  any sign-in within the recent window (last 24h by default).
+
+  Accounts on VIPUsers or PrivilegedAccounts watchlists receive an additive RiskScore
+  boost. Non-watchlist accounts are still returned (leftouter semantics).
+
+  ATT&CK: T1078.004 — Valid Accounts: Cloud Accounts (Persistence / Assume Breach).
+  ZT pillar: Least Privilege (supporting: Assume Breach).
+
+  STARTING TEMPLATE — review all TUNE: comments before deployment. Not production-ready.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+      - AuditLogs
+tactics:
+  - Persistence
+relevantTechniques:
+  - T1078
+  - T1078.004
+requiresUEBA: false
+tuneThresholds:
+  DormantThresholdDays: 30   # TUNE: inactivity window in days. Default 30.
+                              # Increase for lower noise; decrease for tighter detection.
+  RecentWindow: 1d            # TUNE: look-back for the "reactivation" sign-in.
+  BoostVIP: 10                # TUNE: RiskScore increment for VIPUsers-only accounts.
+  BoostPriv: 10               # TUNE: RiskScore increment for PrivilegedAccounts-only accounts.
+  BoostBoth: 25               # TUNE: RiskScore increment for accounts on BOTH watchlists.
+query: |
+  // ── Thresholds — change values here, document reason in docs/tuning-notes.md ──
+  let DormantThresholdDays = 30;   // TUNE: days of inactivity before account is "dormant"
+  let RecentWindow         = 1d;   // TUNE: window to check for reactivation sign-ins
+
+  // ── Watchlist lookups ──────────────────────────────────────────────────────
+  let VIPList = _GetWatchlist("VIPUsers")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+  let PrivList = _GetWatchlist("PrivilegedAccounts")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+  // ── Step 1: Identify admin-role holders from AuditLogs ────────────────────
+  // "Add member to role" events indicate an account holds or held a privileged role.
+  let AdminRoleHolders = AuditLogs
+      | where OperationName in ("Add member to role", "Add eligible member to role")
+      | mv-expand TargetResources
+      | extend TargetUPN = tostring(TargetResources.userPrincipalName)
+      | extend RoleName  = tostring(
+            TargetResources.modifiedProperties[0].newValue)
+      | where isnotempty(TargetUPN)
+      | summarize AssignedRoleFromAudit = make_set(RoleName, 10) by TargetUPN;
+
+  // ── Step 2: Last successful sign-in per account (history window) ───────────
+  let LastSignIn = SigninLogs
+      | where TimeGenerated between (ago(180d) .. ago(RecentWindow))
+      | where ResultType == 0
+      | summarize LastSuccessfulSignIn = max(TimeGenerated) by UserPrincipalName;
+
+  // ── Step 3: Recent (reactivation) sign-ins ────────────────────────────────
+  let RecentSignIns = SigninLogs
+      | where TimeGenerated > ago(RecentWindow)
+      | where ResultType == 0
+      | project TimeGenerated, UserPrincipalName, UserId,
+                IPAddress, AppDisplayName, ConditionalAccessStatus,
+                LocationDetails, MfaDetail;
+
+  // ── Step 4: Join — dormant admin accounts that just signed in ──────────────
+  let BaseEvents = RecentSignIns
+      | join kind=inner (AdminRoleHolders)
+            on $left.UserPrincipalName == $right.TargetUPN
+      | join kind=leftouter (LastSignIn)
+            on $left.UserPrincipalName == $right.UserPrincipalName
+      | where isnotempty(LastSuccessfulSignIn)
+      | where datetime_diff('day', TimeGenerated, LastSuccessfulSignIn)
+              >= DormantThresholdDays
+      | extend DaysDormant = datetime_diff('day', TimeGenerated, LastSuccessfulSignIn);
+
+  // ── Apply watchlist joins and RiskScore boost ──────────────────────────────
+  BaseEvents
+  | join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+  | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+  | extend IsVIP  = isnotempty(VIPReason),
+           IsPriv = isnotempty(AssignedRole)
+  // TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+  | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+  | extend RiskScore = RiskBoost
+  | extend RiskLabel = case(
+      IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+      IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+      IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+      UserPrincipalName)
+  | sort by RiskScore desc, DaysDormant desc, TimeGenerated desc
+  | project TimeGenerated, RiskLabel, RiskScore,
+            IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+            DaysDormant, LastSuccessfulSignIn,
+            AssignedRoleFromAudit, IPAddress, AppDisplayName,
+            ConditionalAccessStatus
+tags:
+  - ZTPillar: LeastPrivilege
+  - ZTPillar_Supporting: AssumeBreach
+  - MITRETactic: Persistence
+  - MITRETechnique: T1078.004
+  - DataSource: SigninLogs+AuditLogs
+  - WatchlistBoost: VIPUsers+PrivilegedAccounts
+  - RequiresUEBA: "false"

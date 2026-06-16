@@ -1,0 +1,131 @@
+id: c1d4e7f0-2a5b-4c8d-e9f2-6b3c5d8e1f0a
+name: MFA / authentication-method tampering
+description: |
+  Detects changes to a user's registered MFA methods or authentication phone app
+  details in AuditLogs. An attacker who obtains valid credentials may register an
+  additional authenticator app, phone number, or FIDO2 key to establish a persistent
+  backdoor — even if the user later changes their password.
+
+  Monitored operations include (but are not limited to):
+  - UpdateStrongAuthenticationPhoneAppDetail  (TOTP/authenticator app change)
+  - Update user                               (broad catch — filtered on auth-property changes)
+  - Register security information             (user registering a new method)
+  - Delete security information               (removing existing MFA)
+  - Update strong authentication method       (method-level changes)
+  - Create or Update FIDO key                 (hardware key registration)
+
+  The query surfaces ALL auth-method change events and boosts the RiskScore for accounts
+  on the VIPUsers or PrivilegedAccounts watchlists so they sort to the top of results.
+  Non-watchlist accounts are still returned (leftouter semantics).
+
+  ATT&CK: T1556.006 — Modify Authentication Process: MFA (Credential Access).
+  Secondary: T1098.005 — Account Manipulation: Device Registration.
+  ZT pillar: Assume Breach (supporting: Verify Explicitly).
+
+  STARTING TEMPLATE — review all TUNE: comments before deployment. Not production-ready.
+severity: High
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - AuditLogs
+tactics:
+  - CredentialAccess
+relevantTechniques:
+  - T1556
+  - T1556.006
+  - T1098.005
+requiresUEBA: false
+tuneThresholds:
+  LookbackWindow: 1d       # TUNE: AuditLogs search window per scheduled run.
+  BoostVIP: 10             # TUNE: RiskScore increment for VIPUsers-only accounts.
+  BoostPriv: 10            # TUNE: RiskScore increment for PrivilegedAccounts-only accounts.
+  BoostBoth: 25            # TUNE: RiskScore increment for accounts on BOTH watchlists.
+  WatchedOperations:       # TUNE: list of AuditLogs OperationName values to monitor.
+                           # Add/remove operations based on your tenant's auth-method
+                           # log verbosity and Entra ID feature set.
+    - "UpdateStrongAuthenticationPhoneAppDetail"
+    - "Update user"
+    - "Register security info"
+    - "Delete security info"
+    - "Update strong authentication method"
+    - "Create FIDO key"
+    - "Update FIDO key"
+    - "User registered security info"
+    - "User deleted security info"
+    - "Admin registered security info"
+    - "Admin deleted security info"
+query: |
+  // ── Thresholds — change values here, document reason in docs/tuning-notes.md ──
+  let LookbackWindow = 1d;  // TUNE: AuditLogs search window per scheduled run
+  // TUNE: AuditLogs operation names covering auth-method registration / deletion / updates
+  let WatchedOperations = dynamic([
+      "UpdateStrongAuthenticationPhoneAppDetail",
+      "Update user",
+      "Register security info",
+      "Delete security info",
+      "Update strong authentication method",
+      "Create FIDO key",
+      "Update FIDO key",
+      "User registered security info",
+      "User deleted security info",
+      "Admin registered security info",
+      "Admin deleted security info"
+  ]);
+
+  // ── Watchlist lookups ──────────────────────────────────────────────────────
+  let VIPList = _GetWatchlist("VIPUsers")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+  let PrivList = _GetWatchlist("PrivilegedAccounts")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+  // ── Base events: auth-method change AuditLogs entries ─────────────────────
+  let BaseEvents = AuditLogs
+      | where TimeGenerated > ago(LookbackWindow)
+      | where OperationName in (WatchedOperations)
+      | where Category in ("UserManagement", "Authentication", "MFA")
+      | mv-expand TargetResources
+      | extend TargetUPN    = tostring(TargetResources.userPrincipalName)
+      | extend TargetObjId  = tostring(TargetResources.id)
+      | extend ChangedProps = tostring(TargetResources.modifiedProperties)
+      | extend ActorUPN     = tostring(InitiatedBy.user.userPrincipalName)
+      | extend ActorIP      = tostring(InitiatedBy.user.ipAddress)
+      // Flag self-initiated changes (actor == target) vs admin-initiated
+      | extend IsSelfInitiated = (ActorUPN =~ TargetUPN)
+      | where isnotempty(TargetUPN)
+      | project TimeGenerated, TargetUPN, TargetObjId,
+                OperationName, ChangedProps, IsSelfInitiated,
+                ActorUPN, ActorIP, CorrelationId,
+                Result, ResultDescription;
+
+  // ── Apply watchlist joins and RiskScore boost ──────────────────────────────
+  BaseEvents
+  | join kind=leftouter (VIPList)  on $left.TargetUPN == $right.UPN
+  | join kind=leftouter (PrivList) on $left.TargetUPN == $right.UPN
+  | extend IsVIP  = isnotempty(VIPReason),
+           IsPriv = isnotempty(AssignedRole)
+  // TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+  | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+  // Self-initiated changes to admin/VIP accounts are higher risk
+  | extend RiskScore = RiskBoost + iff(IsSelfInitiated and (IsVIP or IsPriv), 10, 0)
+  | extend RiskLabel = case(
+      IsVIP and IsPriv, strcat(TargetUPN, " [VIP+PRIV — HIGHEST PRIORITY]"),
+      IsVIP,            strcat(TargetUPN, " [VIP]"),
+      IsPriv,           strcat(TargetUPN, " [PRIV]"),
+      TargetUPN)
+  | sort by RiskScore desc, TimeGenerated desc
+  | project TimeGenerated, RiskLabel, RiskScore,
+            IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+            OperationName, IsSelfInitiated,
+            ActorUPN, ActorIP, ChangedProps,
+            CorrelationId, Result
+tags:
+  - ZTPillar: AssumeBreach
+  - ZTPillar_Supporting: VerifyExplicitly
+  - MITRETactic: CredentialAccess
+  - MITRETechnique: T1556
+  - MITRETechnique: T1556.006
+  - MITRETechnique: T1098.005
+  - DataSource: AuditLogs
+  - WatchlistBoost: VIPUsers+PrivilegedAccounts
+  - RequiresUEBA: "false"

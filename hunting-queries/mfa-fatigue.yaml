@@ -1,0 +1,100 @@
+id: 4b8d2e6f-3a1c-4f9e-b5d7-8c0a1e2f3b4c
+name: MFA fatigue — repeated MFA denials (push bombing)
+description: |
+  Detects accounts that accumulate more than a configurable number of MFA denial events
+  (ResultType 500121 = MFA required and denied / push declined) within a rolling time
+  window. A burst of denied MFA prompts is the signature of a push-bombing / MFA-fatigue
+  attack, where the adversary floods the user with prompts until they accidentally or
+  frustratedly approve one.
+
+  The query aggregates denials per user per window and boosts the RiskScore for accounts
+  on the VIPUsers or PrivilegedAccounts watchlists so they surface at the top of results.
+  Non-watchlist accounts are still returned (leftouter semantics).
+
+  ATT&CK: T1110 — Brute Force (Credential Access). More-precise mapping T1621 (MFA
+  Request Generation) deferred to v0.2.0 per mitre-attack-coverage.md mapping note.
+  ZT pillar: Assume Breach (supporting: Verify Explicitly).
+
+  STARTING TEMPLATE — review all TUNE: comments before deployment. Not production-ready.
+severity: High
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+tactics:
+  - CredentialAccess
+relevantTechniques:
+  - T1110
+requiresUEBA: false
+tuneThresholds:
+  DenialThreshold: 5       # TUNE: number of MFA denials in the window to trigger.
+                           # Default 5. Lower increases sensitivity; raises FP rate.
+  TimeWindowMinutes: 10    # TUNE: rolling window in minutes. Default 10.
+  LookbackWindow: 1d       # TUNE: how far back to search SigninLogs per run.
+  BoostVIP: 10             # TUNE: RiskScore increment for VIPUsers-only accounts.
+  BoostPriv: 10            # TUNE: RiskScore increment for PrivilegedAccounts-only accounts.
+  BoostBoth: 25            # TUNE: RiskScore increment for accounts on BOTH watchlists.
+query: |
+  // ── Thresholds — change values here, document reason in docs/tuning-notes.md ──
+  let DenialThreshold    = 5;        // TUNE: MFA denial count threshold
+  let TimeWindowMinutes  = 10;       // TUNE: rolling window (minutes)
+  let LookbackWindow     = 1d;       // TUNE: search window per scheduled run
+
+  // ── Watchlist lookups ──────────────────────────────────────────────────────
+  let VIPList = _GetWatchlist("VIPUsers")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+  let PrivList = _GetWatchlist("PrivilegedAccounts")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+  // ── Base events: MFA denied / push-declined sign-in attempts ──────────────
+  // ResultType 500121 = MFA required, denied or push notification declined
+  // ResultType 50074  = Strong auth required (user cancelled / timed out)
+  // ResultType 50076  = MFA challenge presented but not satisfied
+  let MFADenials = SigninLogs
+      | where TimeGenerated > ago(LookbackWindow)
+      | where ResultType in (500121, 50074, 50076)
+      | project TimeGenerated, UserPrincipalName, UserId,
+                IPAddress, AppDisplayName, ResultType, ResultDescription,
+                ConditionalAccessStatus, AuthenticationDetails;
+
+  // ── Aggregate denials within the rolling window ────────────────────────────
+  let BaseEvents = MFADenials
+      | summarize DenialCount    = count(),
+                  FirstDenial    = min(TimeGenerated),
+                  LastDenial     = max(TimeGenerated),
+                  UniqueIPs      = make_set(IPAddress, 20),
+                  Apps           = make_set(AppDisplayName, 10),
+                  ResultTypes    = make_set(ResultType, 5)
+        by UserPrincipalName, UserId,
+           bin(TimeGenerated, totimespan(strcat(tostring(TimeWindowMinutes), 'm')))
+      | where DenialCount >= DenialThreshold;
+
+  // ── Apply watchlist joins and RiskScore boost ──────────────────────────────
+  BaseEvents
+  | join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+  | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+  | extend IsVIP  = isnotempty(VIPReason),
+           IsPriv = isnotempty(AssignedRole)
+  // TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+  | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+  | extend RiskScore = RiskBoost
+  | extend RiskLabel = case(
+      IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+      IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+      IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+      UserPrincipalName)
+  | sort by RiskScore desc, DenialCount desc, LastDenial desc
+  | project FirstDenial, LastDenial, RiskLabel, RiskScore,
+            IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+            DenialCount, UniqueIPs, Apps, ResultTypes,
+            WindowMinutes = TimeWindowMinutes
+tags:
+  - ZTPillar: AssumeBreach
+  - ZTPillar_Supporting: VerifyExplicitly
+  - MITRETactic: CredentialAccess
+  - MITRETechnique: T1110
+  - MITRETechnique_Upgrade_v0.2: T1621
+  - DataSource: SigninLogs
+  - WatchlistBoost: VIPUsers+PrivilegedAccounts
+  - RequiresUEBA: "false"

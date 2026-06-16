@@ -1,0 +1,130 @@
+id: 9e6b3d1a-4c8f-4b2e-d7a5-3f0c1e9b5d7a
+name: VIP and privileged account risky sign-ins (UEBA-enriched)
+description: |
+  Surfaces sign-ins where Entra Identity Protection has assigned a medium or high risk
+  level (RiskLevelDuringSignIn), optionally enriched with UEBA BehaviorAnalytics
+  InvestigationPriority scores. The combination of Identity Protection risk scoring
+  and watchlist membership gives the highest-confidence triage signal for compromised
+  VIP or privileged credentials.
+
+  UEBA dependency: this query joins BehaviorAnalytics for InvestigationPriority and
+  peer-group anomaly context. If the BehaviorAnalytics table is absent or empty
+  (UEBA not enabled), the join returns nulls and the query degrades gracefully to
+  a pure SigninLogs + RiskLevelDuringSignIn filter. Remove or comment the
+  BehaviorAnalytics join block (marked // UEBA-DISABLED below) to force degradation.
+
+  Accounts on VIPUsers or PrivilegedAccounts watchlists receive an additive RiskScore
+  boost on top of the base score derived from the Identity Protection risk level.
+  Non-watchlist accounts are still returned (leftouter semantics).
+
+  ATT&CK: T1078.004 — Valid Accounts: Cloud Accounts (Initial Access / Verify Explicitly).
+  ZT pillar: Verify Explicitly (supporting: Assume Breach).
+
+  STARTING TEMPLATE — review all TUNE: comments before deployment. Not production-ready.
+severity: High
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+  - connectorId: BehaviorAnalytics
+    dataTypes:
+      - BehaviorAnalytics
+tactics:
+  - InitialAccess
+relevantTechniques:
+  - T1078
+  - T1078.004
+requiresUEBA: true
+tuneThresholds:
+  RiskLevels:              # TUNE: Identity Protection risk levels to include.
+    - "high"               # Remove "medium" to reduce volume and focus on high-only.
+    - "medium"
+  LookbackWindow: 1d       # TUNE: SigninLogs search window per scheduled run.
+  MinInvestigationPriority: 0   # TUNE: minimum UEBA InvestigationPriority score to
+                                 # include from BehaviorAnalytics (0 = include all).
+                                 # Raise to e.g. 50 to filter low-anomaly UEBA rows.
+  BaseScoreHigh: 20        # TUNE: base RiskScore for Identity Protection "high" risk.
+  BaseScoreMedium: 10      # TUNE: base RiskScore for Identity Protection "medium" risk.
+  BoostVIP: 10             # TUNE: RiskScore increment for VIPUsers-only accounts.
+  BoostPriv: 10            # TUNE: RiskScore increment for PrivilegedAccounts-only accounts.
+  BoostBoth: 25            # TUNE: RiskScore increment for accounts on BOTH watchlists.
+query: |
+  // ── Thresholds — change values here, document reason in docs/tuning-notes.md ──
+  let RiskLevels              = dynamic(["high", "medium"]);  // TUNE: IP risk levels
+  let LookbackWindow          = 1d;    // TUNE: SigninLogs search window
+  let MinInvestigationPriority = 0;   // TUNE: minimum UEBA priority score (0 = all)
+  let BaseScoreHigh           = 20;   // TUNE: base score for "high" risk sign-ins
+  let BaseScoreMedium         = 10;   // TUNE: base score for "medium" risk sign-ins
+
+  // ── Watchlist lookups ──────────────────────────────────────────────────────
+  let VIPList = _GetWatchlist("VIPUsers")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason;
+
+  let PrivList = _GetWatchlist("PrivilegedAccounts")
+      | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource;
+
+  // ── Base events: risky sign-ins from Identity Protection ──────────────────
+  let BaseEvents = SigninLogs
+      | where TimeGenerated > ago(LookbackWindow)
+      | where RiskLevelDuringSignIn in (RiskLevels)
+      | extend BaseScore = case(
+            RiskLevelDuringSignIn == "high",   BaseScoreHigh,
+            RiskLevelDuringSignIn == "medium", BaseScoreMedium,
+            0)
+      | project TimeGenerated, UserPrincipalName, UserId,
+                IPAddress, AppDisplayName, Location,
+                RiskLevelDuringSignIn, RiskState, RiskDetail,
+                ConditionalAccessStatus, MfaDetail,
+                LocationDetails, BaseScore;
+
+  // ── UEBA enrichment: BehaviorAnalytics InvestigationPriority ─────────────
+  // UEBA-DISABLED: comment out this let block and the join below if BehaviorAnalytics
+  // is not available. The query will still return results from SigninLogs alone.
+  // To disable: replace the join with | extend InvestigationPriority = int(null), UserPrincipalName1 = ""
+  let UEBAScores = BehaviorAnalytics
+      | where TimeGenerated > ago(LookbackWindow)
+      | where ActivityInsights != ""
+      | summarize InvestigationPriority = max(InvestigationPriority)
+        by UserPrincipalName
+      | where InvestigationPriority >= MinInvestigationPriority;
+  // END UEBA-DISABLED block
+
+  // ── Join UEBA scores (leftouter — degrades gracefully if table empty) ──────
+  // UEBA-DISABLED: remove this join if BehaviorAnalytics is absent
+  let EnrichedEvents = BaseEvents
+      | join kind=leftouter (UEBAScores)
+            on $left.UserPrincipalName == $right.UserPrincipalName;
+  // END UEBA-DISABLED block
+
+  // ── Apply watchlist joins and RiskScore boost ──────────────────────────────
+  EnrichedEvents
+  | join kind=leftouter (VIPList)  on $left.UserPrincipalName == $right.UPN
+  | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN
+  | extend IsVIP  = isnotempty(VIPReason),
+           IsPriv = isnotempty(AssignedRole)
+  // TUNABLE: +10 VIP-only, +10 Priv-only, +25 both (iff — not cumulative addition)
+  | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0)
+  | extend RiskScore = BaseScore + RiskBoost
+  | extend RiskLabel = case(
+      IsVIP and IsPriv, strcat(UserPrincipalName, " [VIP+PRIV — HIGHEST PRIORITY]"),
+      IsVIP,            strcat(UserPrincipalName, " [VIP]"),
+      IsPriv,           strcat(UserPrincipalName, " [PRIV]"),
+      UserPrincipalName)
+  | sort by RiskScore desc, TimeGenerated desc
+  | project TimeGenerated, RiskLabel, RiskScore,
+            IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource,
+            RiskLevelDuringSignIn, RiskState, RiskDetail,
+            InvestigationPriority,           // null if UEBA disabled
+            IPAddress, Location, AppDisplayName,
+            ConditionalAccessStatus
+tags:
+  - ZTPillar: VerifyExplicitly
+  - ZTPillar_Supporting: AssumeBreach
+  - MITRETactic: InitialAccess
+  - MITRETechnique: T1078
+  - MITRETechnique: T1078.004
+  - DataSource: SigninLogs+BehaviorAnalytics
+  - WatchlistBoost: VIPUsers+PrivilegedAccounts
+  - RequiresUEBA: "true"
+  - UEBATable: BehaviorAnalytics
+  - UEBADegradation: RemoveUEBABlock

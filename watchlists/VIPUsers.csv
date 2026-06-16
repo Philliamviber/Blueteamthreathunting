@@ -1,0 +1,6 @@
+UserPrincipalName,ObjectId,DisplayName,Department,VIPReason,Notes
+ceo.example@example.com,a1b2c3d4-0001-4e5f-8a9b-000000000001,Alex Mercer,Executive Office,Executive,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+cfo.example@example.com,a1b2c3d4-0002-4e5f-8a9b-000000000002,Jordan Blake,Finance,Executive,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+boardmember.example@example.com,a1b2c3d4-0003-4e5f-8a9b-000000000003,Sam Rivera,Board of Directors,BoardMember,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+legalcounsel.example@example.com,a1b2c3d4-0004-4e5f-8a9b-000000000004,Morgan Lee,Legal,LegalCounsel,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+itseclead.example@example.com,a1b2c3d4-0005-4e5f-8a9b-000000000005,Taylor Quinn,Information Security,ITSecurityLead,EXAMPLE ROW — replace with real data; reviewed 2026-06-15

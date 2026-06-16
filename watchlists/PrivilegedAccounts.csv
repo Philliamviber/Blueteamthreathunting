@@ -1,0 +1,6 @@
+UserPrincipalName,ObjectId,DisplayName,AssignedRole,RoleSource,Notes
+globaladmin.example@example.com,b9e8d7c6-0001-4f3a-bc12-000000000011,Chris Holloway,Global Administrator,Static,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+privrolead.example@example.com,b9e8d7c6-0002-4f3a-bc12-000000000012,Dana Nkosi,Privileged Role Administrator,PIM-eligible,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+secadmin.example@example.com,b9e8d7c6-0003-4f3a-bc12-000000000013,Emery Santos,Security Administrator,PIM-eligible,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
+caadmin.example@example.com,b9e8d7c6-0004-4f3a-bc12-000000000014,Frankie Osei,Conditional Access Administrator,PIM-active,EXAMPLE ROW — replace with real data; PIM activation expires 2026-06-16; reviewed 2026-06-15
+useradmin.example@example.com,b9e8d7c6-0005-4f3a-bc12-000000000015,Harper Voss,User Administrator,Static,EXAMPLE ROW — replace with real data; reviewed 2026-06-15
