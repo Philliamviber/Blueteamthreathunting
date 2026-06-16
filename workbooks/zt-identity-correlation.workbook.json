@@ -1,0 +1,221 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# Zero Trust Identity Correlation\n**Pillars covered:** Verify Explicitly · Use Least Privilege · Assume Breach\n\n**Data sources:** `SigninLogs`, `AuditLogs`, `AADUserRiskEvents`, `AADRiskyUsers` (Entra ID diagnostic settings → Log Analytics). Tiles marked **[UEBA]** also join `BehaviorAnalytics` or `IdentityInfo` — they degrade gracefully to null enrichment columns when UEBA is not enabled.\n\n**Watchlists required:** `VIPUsers` and `PrivilegedAccounts` (see `watchlists/` folder). Accounts absent from both watchlists still appear — absence of a boost is not a filter.\n\n> Starting template — tune thresholds (speed, denial count, dormancy window, off-hours definition) in `docs/tuning-notes.md` and the relevant `.kql` / `.yaml` files before production use."
+      },
+      "name": "tile-header"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "a1b2c3d4-0001-4000-8000-000000000001",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "type": 4,
+            "isRequired": true,
+            "value": {
+              "durationMs": 86400000
+            },
+            "typeSettings": {
+              "selectableValues": [
+                {"durationMs": 3600000},
+                {"durationMs": 14400000},
+                {"durationMs": 86400000},
+                {"durationMs": 604800000},
+                {"durationMs": 2592000000}
+              ]
+            },
+            "label": "Time Range"
+          },
+          {
+            "id": "a1b2c3d4-0002-4000-8000-000000000002",
+            "version": "KqlParameterItem/1.0",
+            "name": "AccountFilter",
+            "type": 1,
+            "isRequired": false,
+            "value": "",
+            "label": "UPN filter (VIP / privileged — leave blank for all)",
+            "description": "Optional: enter a full or partial UserPrincipalName to scope tiles to a specific account. Leave blank to show all VIP+privileged hits."
+          }
+        ],
+        "style": "pills"
+      },
+      "name": "tile-params"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Summary — Highest-RiskScore Hits (All Pillars)\nCounts of events touching watchlisted accounts across the selected time window, sorted by RiskScore. Accounts on both `VIPUsers` and `PrivilegedAccounts` receive the highest boost (+25) and sort first.\n\n> Starting template — tune thresholds in `docs/tuning-notes.md`."
+      },
+      "name": "tile-summary-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let FilterUPN = \"{AccountFilter}\"; let AllEvents = union isfuzzy=true ( SigninLogs | where TimeGenerated {TimeRange} | where ResultType == 0 or RiskLevelDuringSignIn in (\"high\", \"medium\") | project TimeGenerated, UserPrincipalName, Source = \"SigninLogs\", Detail = strcat(\"Risk:\", tostring(RiskLevelDuringSignIn), \" CA:\", tostring(ConditionalAccessStatus)) ), ( AuditLogs | where TimeGenerated {TimeRange} | where OperationName in (\"Add member to role\", \"Add eligible member to role\", \"UpdateStrongAuthenticationPhoneAppDetail\", \"Register security info\", \"Delete security info\") | mv-expand TargetResources | extend UserPrincipalName = tostring(TargetResources.userPrincipalName) | where isnotempty(UserPrincipalName) | project TimeGenerated, UserPrincipalName, Source = \"AuditLogs\", Detail = OperationName ); AllEvents | where isempty(FilterUPN) or UserPrincipalName contains FilterUPN | join kind=leftouter (VIPList) on $left.UserPrincipalName == $right.UPN | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend RiskLabel = case(IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(UserPrincipalName, \" [VIP]\"), IsPriv, strcat(UserPrincipalName, \" [PRIV]\"), UserPrincipalName) | where IsVIP or IsPriv | summarize EventCount = count(), LatestEvent = max(TimeGenerated), Sources = make_set(Source, 5), MaxRiskBoost = max(RiskBoost) by RiskLabel, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource | sort by MaxRiskBoost desc, EventCount desc",
+        "size": 0,
+        "title": "Summary — VIP and Privileged Account Events (All Pillars)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "MaxRiskBoost", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-summary-grid"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## Pillar 1 — Verify Explicitly\n**Principle:** Every sign-in must be authenticated and authorized using all available signals (location, device, risk score, MFA). Bypassing Conditional Access or forcing MFA approval through fatigue violates this pillar.\n\n**Detections in this section:** VE-01 Risky Sign-in + CA Gap · VE-02 MFA Failure + New Device/Auth-Method Registration\n\n> Starting template — tune thresholds in `docs/tuning-notes.md`."
+      },
+      "name": "tile-ve-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let FilterUPN = \"{AccountFilter}\"; let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let RiskLevels = dynamic([\"high\", \"medium\"]); let EntityRisk = AADRiskyUsers | where RiskLevel in (\"high\", \"medium\") | project UserPrincipalName, EntityRiskLevel = RiskLevel, EntityRiskState = RiskState; let RiskyInteractive = SigninLogs | where TimeGenerated {TimeRange} | where RiskLevelDuringSignIn in (RiskLevels) | where ConditionalAccessStatus != \"success\" | where isempty(\"{AccountFilter}\") or UserPrincipalName contains \"{AccountFilter}\" | extend CAOutcome = tostring(ConditionalAccessStatus) | project TimeGenerated, UserPrincipalName, UserId, IPAddress, Location, AppDisplayName, RiskLevelDuringSignIn, CAOutcome, AuthenticationRequirement; RiskyInteractive | join kind=inner (EntityRisk) on $left.UserPrincipalName == $right.UserPrincipalName | join kind=leftouter (VIPList) on $left.UserPrincipalName == $right.UPN | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend BaseScore = case(RiskLevelDuringSignIn == \"high\", 20, 10) | extend RiskScore = BaseScore + RiskBoost | extend RiskLabel = case(IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(UserPrincipalName, \" [VIP]\"), IsPriv, strcat(UserPrincipalName, \" [PRIV]\"), UserPrincipalName) | sort by RiskScore desc, TimeGenerated desc | project TimeGenerated, RiskLabel, RiskScore, RiskLevelDuringSignIn, EntityRiskLevel, EntityRiskState, CAOutcome, AuthenticationRequirement, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource, IPAddress, Location, AppDisplayName",
+        "size": 0,
+        "title": "VE-01 — Risky Sign-in + Conditional Access Gap (T1078 / InitialAccess) — Sources: SigninLogs, AADRiskyUsers",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "RiskScore", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-ve-01-risky-signin"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "> **[UEBA note — VE-01]** The source query `ve-01-risky-signin-ca-gap.kql` also joins `BehaviorAnalytics` for `InvestigationPriority` enrichment. That join is omitted here because `BehaviorAnalytics` requires Microsoft Sentinel UEBA to be enabled. If UEBA is active in your workspace, add the join back manually: `| join kind=leftouter (BehaviorAnalytics | summarize InvestigationPriority = max(InvestigationPriority) by UserPrincipalName) on UserPrincipalName`. Rows without the enrichment are still valid — they simply lack the UEBA priority score column."
+      },
+      "name": "tile-ve-01-ueba-note"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let FilterUPN = \"{AccountFilter}\"; let DenialThreshold = 5; let TimeWindowMinutes = 10; let AuthMethodLookback = 4h; let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let MFABursts = SigninLogs | where TimeGenerated {TimeRange} | where ResultType in (500121, 50074, 50076) | where isempty(\"{AccountFilter}\") or UserPrincipalName contains \"{AccountFilter}\" | summarize DenialCount = count(), FirstDenial = min(TimeGenerated), LastDenial = max(TimeGenerated), UniqueIPs = make_set(IPAddress, 20), Apps = make_set(AppDisplayName, 10) by UserPrincipalName, UserId, bin(TimeGenerated, totimespan(strcat(tostring(TimeWindowMinutes), 'm'))) | where DenialCount >= DenialThreshold; let AuthMethodChanges = AuditLogs | where TimeGenerated {TimeRange} | where OperationName in (\"UpdateStrongAuthenticationPhoneAppDetail\", \"Register security info\", \"User registered security info\", \"Admin registered security info\", \"Create FIDO key\", \"Update FIDO key\", \"Update strong authentication method\") | mv-expand TargetResources | extend TargetUPN = tostring(TargetResources.userPrincipalName) | extend ActorUPN = tostring(InitiatedBy.user.userPrincipalName) | where isnotempty(TargetUPN) | project AuditTime = TimeGenerated, TargetUPN, ActorUPN, AuthOperation = OperationName; MFABursts | join kind=leftouter (AuthMethodChanges) on $left.UserPrincipalName == $right.TargetUPN | extend TimeDeltaHours = abs(datetime_diff('minute', iff(isnotempty(AuditTime), AuditTime, LastDenial), LastDenial)) / 60.0 | extend HasNearbyAuthChange = isnotempty(AuthOperation) and TimeDeltaHours <= 4 | join kind=leftouter (VIPList) on $left.UserPrincipalName == $right.UPN | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend RiskScore = RiskBoost + iff(HasNearbyAuthChange, 15, 0) | extend RiskLabel = case(IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(UserPrincipalName, \" [VIP]\"), IsPriv, strcat(UserPrincipalName, \" [PRIV]\"), UserPrincipalName) | sort by RiskScore desc, DenialCount desc, LastDenial desc | project FirstDenial, LastDenial, RiskLabel, RiskScore, DenialCount, UniqueIPs, Apps, HasNearbyAuthChange, AuthOperation, AuditTime, ActorUPN, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource",
+        "size": 0,
+        "title": "VE-02 — MFA Denial Burst + Auth-Method Registration Near Burst (T1110 / CredentialAccess) — Sources: SigninLogs, AuditLogs — TUNE: DenialThreshold=5, window=10 min",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "RiskScore", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-ve-02-mfa-burst"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## Pillar 2 — Use Least Privilege\n**Principle:** Grant only the minimum role needed for the minimum time. Standing permanent admin access is a risk. Privilege creep and dormant role holders must be detected and remediated.\n\n**Detections in this section:** LP-01 Role Assignment Outside PIM · LP-02 Dormant Admin Reactivation\n\n> Starting template — tune thresholds in `docs/tuning-notes.md`."
+      },
+      "name": "tile-lp-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let FilterUPN = \"{AccountFilter}\"; let PIMActivationLookback = 2h; let HighPrivRoles = dynamic([\"Global Administrator\", \"Privileged Role Administrator\", \"Security Administrator\", \"Exchange Administrator\", \"SharePoint Administrator\", \"Hybrid Identity Administrator\", \"Application Administrator\", \"Cloud Application Administrator\", \"Directory Synchronization Accounts\"]); let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let RoleAssignments = AuditLogs | where TimeGenerated {TimeRange} | where OperationName in (\"Add member to role\", \"Add scoped member to role\", \"Add eligible member to role\") | mv-expand TargetResources | extend TargetUPN = tostring(TargetResources.userPrincipalName) | extend RoleAssigned = tostring(TargetResources.modifiedProperties[0].newValue) | extend ActorUPN = tostring(InitiatedBy.user.userPrincipalName) | extend ActorIPAddress = tostring(InitiatedBy.user.ipAddress) | extend IsHighPrivRole = RoleAssigned in (HighPrivRoles) | where isnotempty(TargetUPN) | where isempty(\"{AccountFilter}\") or TargetUPN contains \"{AccountFilter}\" | project AssignmentTime = TimeGenerated, TargetUPN, RoleAssigned, IsHighPrivRole, ActorUPN, ActorIPAddress, OperationName, CorrelationId, Result; let PIMActivations = AuditLogs | where TimeGenerated {TimeRange} | where OperationName in (\"Add member to role (PIM activation)\", \"Activate PIM eligible role\") | mv-expand TargetResources | extend PIMActorUPN = tostring(TargetResources.userPrincipalName) | project PIMActivationTime = TimeGenerated, PIMActorUPN; RoleAssignments | join kind=leftouter (PIMActivations) on $left.ActorUPN == $right.PIMActorUPN | extend PIMPreceded = isnotempty(PIMActivationTime) and PIMActivationTime between ((AssignmentTime - PIMActivationLookback) .. AssignmentTime) | extend BypassedPIM = (not(PIMPreceded)) and (OperationName == \"Add member to role\" or OperationName == \"Add scoped member to role\") | join kind=leftouter (VIPList) on $left.TargetUPN == $right.UPN | join kind=leftouter (PrivList) on $left.TargetUPN == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend RiskScore = RiskBoost + iff(IsHighPrivRole, 15, 0) + iff(BypassedPIM, 10, 0) | extend RiskLabel = case(IsVIP and IsPriv, strcat(TargetUPN, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(TargetUPN, \" [VIP]\"), IsPriv, strcat(TargetUPN, \" [PRIV]\"), TargetUPN) | sort by RiskScore desc, IsHighPrivRole desc, AssignmentTime desc | project AssignmentTime, RiskLabel, RiskScore, RoleAssigned, IsHighPrivRole, BypassedPIM, PIMPreceded, ActorUPN, ActorIPAddress, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource, OperationName, CorrelationId, Result",
+        "size": 0,
+        "title": "LP-01 — Role Assignment Outside PIM Workflow (T1098 / PrivilegeEscalation) — Sources: AuditLogs — TUNE: PIMActivationLookback=2h, HighPrivRoles list",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "RiskScore", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-lp-01-role-assignment"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "> **[UEBA note — LP-01]** The source query `lp-01-role-assignment-outside-pim.kql` optionally joins `IdentityInfo` to enrich the assigning actor's department and job title, confirming whether the assignment is consistent with their role. That join is omitted here because `IdentityInfo` requires UEBA. If UEBA is enabled, add: `| join kind=leftouter (IdentityInfo | summarize arg_max(TimeGenerated, *) by AccountUPN | project AccountUPN, ActorDepartment = Department, ActorJobTitle = JobTitle) on $left.ActorUPN == $right.AccountUPN`. Results without UEBA are still valid but lack actor-context enrichment."
+      },
+      "name": "tile-lp-01-ueba-note"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let FilterUPN = \"{AccountFilter}\"; let DormantThresholdDays = 30; let RecentWindow = 1d; let HistoryWindow = 180d; let OffHoursStart = 7; let OffHoursEnd = 19; let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let AdminRoleHolders = AuditLogs | where OperationName in (\"Add member to role\", \"Add eligible member to role\") | mv-expand TargetResources | extend TargetUPN = tostring(TargetResources.userPrincipalName) | extend RoleName = tostring(TargetResources.modifiedProperties[0].newValue) | where isnotempty(TargetUPN) | summarize AssignedRolesFromAudit = make_set(RoleName, 10) by TargetUPN; let LastSignIn = SigninLogs | where TimeGenerated between (ago(HistoryWindow) .. ago(RecentWindow)) | where ResultType == 0 | summarize LastSuccessfulSignIn = max(TimeGenerated) by UserPrincipalName; let RecentSignIns = SigninLogs | where TimeGenerated {TimeRange} | where ResultType == 0 | where isempty(\"{AccountFilter}\") or UserPrincipalName contains \"{AccountFilter}\" | project ReactivationTime = TimeGenerated, UserPrincipalName, UserId, IPAddress, AppDisplayName, ConditionalAccessStatus; RecentSignIns | join kind=inner (AdminRoleHolders) on $left.UserPrincipalName == $right.TargetUPN | join kind=leftouter (LastSignIn) on $left.UserPrincipalName == $right.UserPrincipalName | where isnotempty(LastSuccessfulSignIn) | where datetime_diff('day', ReactivationTime, LastSuccessfulSignIn) >= DormantThresholdDays | extend DaysDormant = datetime_diff('day', ReactivationTime, LastSuccessfulSignIn) | extend LocalHour = hourofday(ReactivationTime) | extend DayOfWeek = dayofweek(ReactivationTime) | extend IsWeekend = DayOfWeek in (0, 6) | extend IsOffHours = (LocalHour < OffHoursStart or LocalHour >= OffHoursEnd) | extend OffHoursFlag = IsWeekend or IsOffHours | join kind=leftouter (VIPList) on $left.UserPrincipalName == $right.UPN | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend RiskScore = RiskBoost + iff(OffHoursFlag, 10, 0) | extend RiskLabel = case(IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(UserPrincipalName, \" [VIP]\"), IsPriv, strcat(UserPrincipalName, \" [PRIV]\"), UserPrincipalName) | sort by RiskScore desc, DaysDormant desc, ReactivationTime desc | project ReactivationTime, RiskLabel, RiskScore, DaysDormant, LastSuccessfulSignIn, AssignedRolesFromAudit, OffHoursFlag, IsWeekend, IsOffHours, LocalHour, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource, IPAddress, AppDisplayName, ConditionalAccessStatus",
+        "size": 0,
+        "title": "LP-02 — Dormant Admin Reactivation (T1078 / Persistence) — Sources: SigninLogs, AuditLogs — TUNE: DormantThresholdDays=30, off-hours 07:00-19:00 UTC",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "RiskScore", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-lp-02-dormant-admin"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## Pillar 3 — Assume Breach\n**Principle:** Operate as if a threat actor already holds valid credentials. Detect post-authentication behaviors: physically impossible travel between sign-in locations, MFA push-bombing combined with authenticator registration (full attack chain), and auth-method tampering for persistence.\n\n**Detections in this section:** AB-01 Impossible Travel + Risk Event Corroboration · AB-02 MFA Fatigue + Auth-Method Tampering (Full Attack Chain)\n\n> Starting template — tune thresholds in `docs/tuning-notes.md`."
+      },
+      "name": "tile-ab-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let FilterUPN = \"{AccountFilter}\"; let MaxSpeedKmh = 800; let MinDistanceKm = 50; let EarthRadiusKm = 6371.0; let CorroboratingRiskTypes = dynamic([\"atypicalTravel\", \"unfamiliarFeatures\", \"maliciousIPAddress\", \"anonymizedIPAddress\", \"impossibleTravel\"]); let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let SignIns = SigninLogs | where TimeGenerated {TimeRange} | where ResultType == 0 | where isnotempty(LocationDetails) | where isempty(\"{AccountFilter}\") or UserPrincipalName contains \"{AccountFilter}\" | extend Lat = toreal(LocationDetails.geoCoordinates.latitude), Lon = toreal(LocationDetails.geoCoordinates.longitude), City = tostring(LocationDetails.city), Country = tostring(LocationDetails.countryOrRegion) | where isnotnull(Lat) and isnotnull(Lon) | project TimeGenerated, UserPrincipalName, UserId, IPAddress, City, Country, Lat, Lon, AppDisplayName, ConditionalAccessStatus; let TravelPairs = SignIns | sort by UserPrincipalName asc, TimeGenerated asc | extend PrevTime = prev(TimeGenerated, 1), PrevLat = prev(Lat, 1), PrevLon = prev(Lon, 1), PrevCity = prev(City, 1), PrevCountry = prev(Country, 1), PrevIP = prev(IPAddress, 1), PrevUPN = prev(UserPrincipalName, 1) | where UserPrincipalName == PrevUPN | extend ElapsedHours = datetime_diff('second', TimeGenerated, PrevTime) / 3600.0 | where ElapsedHours > 0 | extend DeltaLatRad = (Lat - PrevLat) * pi() / 180, DeltaLonRad = (Lon - PrevLon) * pi() / 180, Lat1Rad = PrevLat * pi() / 180, Lat2Rad = Lat * pi() / 180 | extend A = sin(DeltaLatRad / 2) * sin(DeltaLatRad / 2) + cos(Lat1Rad) * cos(Lat2Rad) * sin(DeltaLonRad / 2) * sin(DeltaLonRad / 2) | extend DistanceKm = 2 * EarthRadiusKm * asin(sqrt(A)) | where DistanceKm > MinDistanceKm | extend SpeedKmh = DistanceKm / ElapsedHours | where SpeedKmh > MaxSpeedKmh; let RiskCorroboration = AADUserRiskEvents | where TimeGenerated {TimeRange} | where RiskEventType in (CorroboratingRiskTypes) | summarize RiskEventTypes = make_set(RiskEventType, 10), HighestRiskLevel = max(RiskLevel) by UserPrincipalName; TravelPairs | join kind=leftouter (RiskCorroboration) on $left.UserPrincipalName == $right.UserPrincipalName | extend HasRiskCorroboration = isnotempty(RiskEventTypes) | join kind=leftouter (VIPList) on $left.UserPrincipalName == $right.UPN | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend RiskScore = RiskBoost + iff(HasRiskCorroboration, 20, 0) | extend RiskLabel = case(IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(UserPrincipalName, \" [VIP]\"), IsPriv, strcat(UserPrincipalName, \" [PRIV]\"), UserPrincipalName) | sort by RiskScore desc, SpeedKmh desc, TimeGenerated desc | project TimeGenerated, RiskLabel, RiskScore, PrevTime, PrevCity, PrevCountry, PrevIP, City, Country, IPAddress, DistanceKm = round(DistanceKm, 1), SpeedKmh = round(SpeedKmh, 1), ElapsedHours = round(ElapsedHours, 4), HasRiskCorroboration, RiskEventTypes, HighestRiskLevel, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource, AppDisplayName, ConditionalAccessStatus",
+        "size": 0,
+        "title": "AB-01 — Impossible Travel + Identity Protection Risk Corroboration (T1078 / InitialAccess) — Sources: SigninLogs, AADUserRiskEvents — TUNE: MaxSpeedKmh=800, MinDistanceKm=50",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "RiskScore", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-ab-01-impossible-travel"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let FilterUPN = \"{AccountFilter}\"; let DenialThreshold = 5; let TimeWindowMinutes = 10; let TamperWindowHours = 24; let VIPList = _GetWatchlist(\"VIPUsers\") | project UPN = UserPrincipalName, ObjId = ObjectId, VIPReason; let PrivList = _GetWatchlist(\"PrivilegedAccounts\") | project UPN = UserPrincipalName, ObjId = ObjectId, AssignedRole, RoleSource; let MFABursts = SigninLogs | where TimeGenerated {TimeRange} | where ResultType in (500121, 50074, 50076) | where isempty(\"{AccountFilter}\") or UserPrincipalName contains \"{AccountFilter}\" | summarize DenialCount = count(), FirstDenial = min(TimeGenerated), LastDenial = max(TimeGenerated), UniqueIPs = make_set(IPAddress, 20), Apps = make_set(AppDisplayName, 10), ResultTypes = make_set(ResultType, 5) by UserPrincipalName, UserId, bin(TimeGenerated, totimespan(strcat(tostring(TimeWindowMinutes), 'm'))) | where DenialCount >= DenialThreshold; let AuthMethodTampering = AuditLogs | where TimeGenerated {TimeRange} | where OperationName in (\"UpdateStrongAuthenticationPhoneAppDetail\", \"Register security info\", \"Delete security info\", \"User registered security info\", \"User deleted security info\", \"Admin registered security info\", \"Admin deleted security info\", \"Update strong authentication method\", \"Create FIDO key\", \"Update FIDO key\") | where Category in (\"UserManagement\", \"Authentication\", \"MFA\") | mv-expand TargetResources | extend TargetUPN = tostring(TargetResources.userPrincipalName) | extend ActorUPN = tostring(InitiatedBy.user.userPrincipalName) | extend ActorIP = tostring(InitiatedBy.user.ipAddress) | extend IsSelfChange = (ActorUPN =~ TargetUPN) | where isnotempty(TargetUPN) | project TamperTime = TimeGenerated, TargetUPN, ActorUPN, ActorIP, TamperOperation = OperationName, IsSelfChange, CorrelationId; MFABursts | join kind=leftouter (AuthMethodTampering) on $left.UserPrincipalName == $right.TargetUPN | extend HoursBetween = abs(datetime_diff('minute', iff(isnotempty(TamperTime), TamperTime, LastDenial), LastDenial)) / 60.0 | extend IsFullAttackChain = isnotempty(TamperOperation) and HoursBetween <= TamperWindowHours | join kind=leftouter (VIPList) on $left.UserPrincipalName == $right.UPN | join kind=leftouter (PrivList) on $left.UserPrincipalName == $right.UPN | extend IsVIP = isnotempty(VIPReason), IsPriv = isnotempty(AssignedRole) | extend RiskBoost = case(IsVIP and IsPriv, 25, IsVIP or IsPriv, 10, 0) | extend RiskScore = RiskBoost + iff(IsFullAttackChain, 25, 0) + iff(IsFullAttackChain and IsSelfChange, 5, 0) | extend RiskLabel = case(IsVIP and IsPriv, strcat(UserPrincipalName, \" [VIP+PRIV — HIGHEST PRIORITY]\"), IsVIP, strcat(UserPrincipalName, \" [VIP]\"), IsPriv, strcat(UserPrincipalName, \" [PRIV]\"), UserPrincipalName) | sort by RiskScore desc, IsFullAttackChain desc, DenialCount desc, LastDenial desc | project FirstDenial, LastDenial, RiskLabel, RiskScore, DenialCount, UniqueIPs, Apps, ResultTypes, IsFullAttackChain, TamperOperation, TamperTime, IsSelfChange, ActorUPN, ActorIP, HoursBetween, CorrelationId, IsVIP, IsPriv, VIPReason, AssignedRole, RoleSource",
+        "size": 0,
+        "title": "AB-02 — MFA Fatigue + Auth-Method Tampering (Full Attack Chain) (T1110 + T1556 / CredentialAccess + Persistence) — Sources: SigninLogs, AuditLogs — TUNE: DenialThreshold=5, TamperWindowHours=24",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "sortBy": [{"itemKey": "RiskScore", "sortOrder": 2}]
+        }
+      },
+      "name": "tile-ab-02-mfa-fatigue-chain"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## Notes for Analysts\n\n**Watchlist boost model (tunable — see `docs/tuning-notes.md`):**\n\n| Account status | RiskScore boost | RiskLabel suffix |\n|---|---|---|\n| Not on either watchlist | +0 | _(none)_ |\n| VIPUsers only | +10 | `[VIP]` |\n| PrivilegedAccounts only | +10 | `[PRIV]` |\n| Both watchlists | +25 | `[VIP+PRIV — HIGHEST PRIORITY]` |\n\n**UEBA-dependent tiles:** VE-01 (BehaviorAnalytics — InvestigationPriority enrichment) and LP-01 (IdentityInfo — actor department/job-title enrichment) are noted inline. Both tiles degrade gracefully — they return results without those columns when UEBA is not enabled. No tile in this workbook hard-requires UEBA to return rows.\n\n**Time Range parameter:** All KQL tiles bind to the `{TimeRange}` token injected by the workbook parameter. The `timeContext.durationMs` field on each tile is a UI fallback default (24 hours) used by the workbook renderer before a selection is made.\n\n**UPN filter parameter:** The `{AccountFilter}` token is applied in each tile's `where` clause. An empty string passes all accounts through. Partial matches (e.g. `@contoso.com`) are supported via the `contains` operator.\n\n**File:** `workbooks/zt-identity-correlation.workbook.json` — starting template, not production-ready. All thresholds are tunable; record changes in `docs/tuning-notes.md`."
+      },
+      "name": "tile-footer-notes"
+    }
+  ],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}
