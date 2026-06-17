@@ -7,12 +7,12 @@ session can read this file and execute the build end-to-end.
 
 1. Refresh PATH so `git` resolves:
    `$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine')+';'+[Environment]::GetEnvironmentVariable('Path','User')`
-2. Work in `C:\Users\pstib\Projects\blueteamthreathunting` (git already initialized, `origin` set).
+2. Work in `C:\Users\<username>\Projects\blueteamthreathunting` (git already initialized, `origin` set).
 3. Dispatch the **local user-scope subagents** named in the delegation table below, in order,
    using the grammar `Use the <agent> subagent to <task>`. (Copies of these agents also live in
    `.claude/agents/` for portability.)
 4. Write artifacts into the repo folders. **Mirror the conventions** of the sibling repo
-   `C:\Users\pstib\Projects\Sentinelmonitoring` (see Reference files).
+   `C:\Users\<username>\Projects\Sentinelmonitoring` (see Reference files).
 5. **Commit at milestones** (after scaffold review, after content, after docs, final) as
    `Philliamviber <Philliamviber@users.noreply.github.com>` and **push to GitHub via Git
    Credential Manager — do NOT use the Copilot-hosted GitHub MCP** (its credits are blocked).
@@ -70,11 +70,11 @@ Target artifacts:
 
 ## Reference files (mirror these conventions)
 
-- `C:\Users\pstib\Projects\Sentinelmonitoring\analytics-rules\entra-privileged-role-added.json` — ARM analytics-rule shape (GUID name, tactics/techniques, entityMappings).
-- `C:\Users\pstib\Projects\Sentinelmonitoring\hunting-queries\new-legacy-auth-user.yaml` — hunting-query YAML schema (`id`, `name`, `query`, …).
-- `C:\Users\pstib\Projects\Sentinelmonitoring\watchlists\host-inventory.csv` + `host-inventory.md` — watchlist CSV + schema-doc pattern.
-- `C:\Users\pstib\Projects\Sentinelmonitoring\workbooks\05-entra-identity-compromise.workbook.json` — workbook JSON shape.
-- `C:\Users\pstib\Projects\Sentinelmonitoring\README.md` and `docs\` — README and docs style.
+- `C:\Users\<username>\Projects\Sentinelmonitoring\analytics-rules\entra-privileged-role-added.json` — ARM analytics-rule shape (GUID name, tactics/techniques, entityMappings).
+- `C:\Users\<username>\Projects\Sentinelmonitoring\hunting-queries\new-legacy-auth-user.yaml` — hunting-query YAML schema (`id`, `name`, `query`, …).
+- `C:\Users\<username>\Projects\Sentinelmonitoring\watchlists\host-inventory.csv` + `host-inventory.md` — watchlist CSV + schema-doc pattern.
+- `C:\Users\<username>\Projects\Sentinelmonitoring\workbooks\05-entra-identity-compromise.workbook.json` — workbook JSON shape.
+- `C:\Users\<username>\Projects\Sentinelmonitoring\README.md` and `docs\` — README and docs style.
 
 ## Sourcing
 
